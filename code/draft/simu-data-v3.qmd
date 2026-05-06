@@ -1,0 +1,954 @@
+---
+title: "simu-data-v3"
+author: "JT Miller"
+format: html
+editor: visual
+---
+
+## Simulate Pheno Extraction and Interpolation Across a species Range
+
+### Methods
+
+Load Packages
+
+```{r}
+library(rnaturalearth)
+library(sf)
+library(ggplot2)
+library(terra)
+library(dplyr)
+library(patchwork)
+library(dbscan)
+library(mgcv)
+```
+
+#### Step 1: Create Nevada Phenology Simulation with Daymet climate Data
+
+```{r}
+# get nevada boundary
+nevada <- ne_states(country = "United States of America", 
+                    returnclass = "sf") %>% filter(name == "Nevada")
+
+```
+
+```{r}
+#| eval: false
+# Path to Daymet data
+# daymet_path <- "/orange/guralnick/daymet-daily/"
+# 
+# # Function to extract Nevada data from Daymet NetCDF
+# extract_nevada_daymet <- function(variable, years) {
+#   
+#   climate_list <- list()
+#   
+#   for(year in years) {
+#     # Load NetCDF file
+#     nc_file <- file.path(daymet_path, 
+#                          paste0("daymet_v4_daily_na_", variable, "_", year, ".nc"))
+#     climate_rast <- rast(nc_file)
+#     
+#     # Reproject Nevada to match Daymet CRS
+#     nevada_reproj <- st_transform(nevada, crs(climate_rast))
+#     nevada_vect <- vect(nevada_reproj)
+#     
+#     # Crop and mask to Nevada
+#     climate_nv <- crop(climate_rast, nevada_vect, mask = TRUE)
+#     
+#     climate_list[[as.character(year)]] <- climate_nv
+#   }
+#   
+#   # Combine all years
+#   climate_all <- do.call(c, climate_list)
+#   
+#   return(climate_all)
+# }
+# 
+# # Extract data for 2017-2020
+# years <- 2017:2020
+# tmin_nv <- extract_nevada_daymet("tmin", years)
+# tmax_nv <- extract_nevada_daymet("tmax", years)
+# prcp_nv <- extract_nevada_daymet("prcp", years)
+# 
+# # combine elements into a singular raster
+# tmin_nv_comined <- rast(tmin_nv)
+# tmax_nv_comined <- rast(tmax_nv)
+# prcp_nv_comined <- rast(prcp_nv)
+# 
+# # additionally calc tmean from tmin and tmax 
+# tmean_nv <- (tmin_nv_comined + tmax_nv_comined)/2
+# 
+# # Save for later use
+# writeRaster(tmin_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif", overwrite = TRUE)
+# writeRaster(tmax_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmax_2017_2020_daymet.tif", overwrite = TRUE)
+# writeRaster(prcp_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_prcp_2017_2020_daymet.tif", overwrite = TRUE)
+# writeRaster(tmean_nv, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmean_2017_2020_daymet.tif", overwrite = TRUE)
+
+```
+
+Read in Raster Stack
+
+```{r}
+tmin_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif")
+tmax_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif")
+tmean_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmean_2017_2020_daymet.tif")
+ppt_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_prcp_2017_2020_daymet.tif")
+```
+
+Create a fake species range
+
+```{r}
+nevada_bbox <- st_bbox(nevada)
+
+species_range <- st_polygon(list(cbind(
+                        c(-120, -119, -117, -115, -116, -118, -120), # lons
+                        c(36, 39, 41, 39.5, 37, 35.5, 36)))) %>% #lats
+  st_sfc(crs = st_crs(nevada)) %>% 
+  st_sf() %>% 
+  st_intersection(nevada) # clip to nev boundary
+
+ggplot() + 
+  geom_sf(data = nevada, mapping = aes(), fill = "lightgray") + 
+  geom_sf(data = species_range, mapping = aes(), fill = "darkgreen", alpha = 0.5) + 
+  theme_bw() + 
+  ggtitle("Species S Distribution in Nevada")
+```
+
+#### Step 2: Set-up flowering Response
+
+```{r}
+#| output: true
+## Create a true data generating process
+params <- list(
+  intercept = 170,      # flowering DOY when temp = 0°C
+  temp_slope = -3.5,    # days earlier per 1°C increase
+  sigma_spatial = 5, # variation between sites
+  sigma_individual = 2, # variation within populations
+  ppt_min = 25, # min ppt mm needed for flower on temp schedule
+  ppt_max = 85, # ppt above which penalty on flowering begins
+  ppt_max_penalty = 60 # maximum DOY penalty for excess ppt
+)
+
+# Population flowering distributions
+sim_pop_flowering <- function(temp, ppt, n_individuals = 100, par = params){
+  mu_site <- par$intercept + par$temp_slope * temp
+  
+  ppt_mid <- (par$ppt_min + par$ppt_max) / 2  # peak of parabola (minimum penalty)
+  
+  ppt_penalty <- if(ppt < par$ppt_min){
+    par$ppt_max_penalty  # below minimum: flat max penalty
+  } else if(ppt > par$ppt_max){
+    par$ppt_max_penalty  # above maximum: flat max penalty
+  } else {
+    # parabola between ppt_min and ppt_max, 0 at midpoint, ppt_max_penalty at edges
+    par$ppt_max_penalty * ((ppt - ppt_mid) / (ppt_mid - par$ppt_min))^2
+  }
+  
+  mu_site <- mu_site + ppt_penalty
+  
+  flowering_times <- rnorm(n_individuals,
+                           mean = mu_site,
+                           sd = par$sigma_individual)
+  return(flowering_times)
+}
+# visualize response curve with phenology dists
+ppt_scenarios <- c(20, 30, 45, 100)  # drought, adequate, optimal, excess
+ppt_labels <- c("Drought (<25mm)", "Adequate (30mm)", "Optimal (50mm)", "Excess (>75mm)")
+temp_range <- seq(0, 25, by = 0.5)
+
+response_distributions <- expand.grid(temp_range = temp_range, ppt = ppt_scenarios) %>%
+  mutate(ppt_label = factor(ppt, levels = ppt_scenarios, labels = ppt_labels)) %>%
+  mutate(
+    distribution = purrr::pmap(list(temp_range, ppt), function(t, p)
+      sim_pop_flowering(t, p, n_individuals = 500, par = params)),
+    onset_10  = purrr::map_dbl(distribution, ~quantile(.x, 0.10)),
+    median_50 = purrr::map_dbl(distribution, ~quantile(.x, 0.50)),
+    offset_90 = purrr::map_dbl(distribution, ~quantile(.x, 0.90))
+  )
+
+
+response_long <- response_distributions %>%
+  tidyr::pivot_longer(cols = c(onset_10, median_50, offset_90),
+                      names_to = "phenometric",
+                      values_to = "doy") %>%
+  mutate(phenometric = factor(phenometric,
+                              levels = c("onset_10", "median_50", "offset_90"),
+                              labels = c("Onset (10%)", "Median (50%)", "Offset (90%)")))
+
+ggplot(response_long, aes(x = temp_range, y = doy, color = phenometric, linetype = phenometric)) +
+  geom_ribbon(data = response_distributions,
+              aes(x = temp_range, ymin = onset_10, ymax = offset_90),
+              fill = "yellow", alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("darkred", "darkorange", "steelblue")) +
+  scale_linetype_manual(values = c("dashed", "solid", "dashed")) +
+  facet_wrap(~ppt_label) +
+  labs(color = "Phenometric", linetype = "Phenometric",
+       x = "Mean Spring Temperature (°C)", y = "Flowering DOY",
+       title = "Flowering Response to Temperature Across Precipitation Scenarios") +
+  theme_bw()
+```
+
+Match up species range with climate, then simu spring flowering
+
+```{r}
+#| output: true
+# reproj species range to match clim data
+species_range_clim <- st_transform(species_range, crs = crs(tmean_nev))
+
+# create a point for each 1km cell center within the species range (res of daymet clim layer)
+tmean_species <- crop(tmean_nev, vect(species_range_clim), mask = TRUE)
+ppt_species <- crop(ppt_nev, vect(species_range_clim), mask = TRUE)
+# extract cell centers as pts 
+cells <- cells(tmean_species[[1]]) # get cell numbers
+cell_coords <- xyFromCell(tmean_species[[1]], cells)
+cell_pts <- st_as_sf(data.frame(cell_coords), 
+                    coords = c("x", "y"), 
+                    crs = crs(tmean_nev))
+
+## Do this for each year 
+years <- 2017:2020
+days_per_year <- c(365,365,365,366)
+spring_doy <- 30:150
+
+# calc cumulative yera positions 
+year_starts <- c(1, cumsum(days_per_year[-length(days_per_year)]) + 1)
+names(year_starts) <- years
+
+# genearte true occurrences for all years
+cells_true_flowering_all <- list()
+for(i in seq_along(years)){
+  # get year and when year starts in raster
+  year <- years[i]
+  year_start <- year_starts[i]
+  # get spring layers for this year
+  spring_layers_year <- (year_start - 1) + spring_doy
+  # calc spring climate for this year
+  tmean_spring <- mean(tmean_species[[spring_layers_year]])
+  ppt_spring <- sum(ppt_species[[spring_layers_year]])
+  # extract clim vals 
+  climate_data <- terra::extract(c(tmean_spring, ppt_spring), vect(cell_pts))
+  # generate cell phenometrics per year
+  cells_true_flowering__dists_year <- cell_pts %>% 
+  st_drop_geometry() %>% 
+  bind_cols(st_coordinates(cell_pts)) %>% 
+  mutate(
+    tmean_spring = climate_data$mean,
+    ppt_spring = climate_data$sum, 
+    year = year
+  ) %>% 
+  rowwise() %>% 
+  mutate(
+    cell_flowering_distribution = list(sim_pop_flowering(tmean_spring, ppt = ppt_spring, n_individuals = 100, par = params)
+  ), 
+  cell_flowering_onset = quantile(cell_flowering_distribution, 0.10), 
+  cell_flowering_median = quantile(cell_flowering_distribution, 0.50), 
+  cell_flowering_offset = quantile(cell_flowering_distribution, 0.90)) %>% 
+  ungroup() 
+  cells_true_flowering_all[[as.character(year)]] <- cells_true_flowering__dists_year
+ 
+}
+
+# combine all years
+cells_true_flowering <- bind_rows(cells_true_flowering_all)
+cells_true_flowering_sf  <- st_as_sf(cells_true_flowering, 
+                                coords = c("X", "Y"), 
+                                crs = crs(tmean_nev))
+
+
+true_flowering_plot_all <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = cells_true_flowering_sf , mapping = aes(color = cell_flowering_onset), size = 0.5) + 
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Flowering\nDOY") + 
+  facet_wrap(~year) +
+  ggtitle("True Flowering Onset (10%) Across Species Range") +
+  theme_bw()
+  
+print(true_flowering_plot_all)
+
+## create a vis to understand more about the species range. 
+# Storage for results
+spring_tmean_all <- c()
+spring_ppt_all   <- c()
+
+for (i in seq_along(years)) {
+  yr <- years[i]
+  
+  # Identify spring layers for this year
+  spring_layers_year <- (year_starts[i] + spring_doy - 1)
+  
+  # Mean spring temp and total spring ppt per cell
+  tmean_spring_r <- mean(tmean_species[[spring_layers_year]])
+  ppt_spring_r   <- sum(ppt_species[[spring_layers_year]])
+  
+  # Extract values at cell centers
+  tmean_vals <- terra::extract(tmean_spring_r, vect(cell_pts))[, 2]
+  ppt_vals   <- terra::extract(ppt_spring_r,   vect(cell_pts))[, 2]
+  
+  spring_tmean_all <- c(spring_tmean_all, tmean_vals)
+  spring_ppt_all   <- c(spring_ppt_all,   ppt_vals)
+}
+
+# Combine into a data frame, dropping NAs
+df <- data.frame(
+  tmean_spring = spring_tmean_all,
+  ppt_spring   = spring_ppt_all
+) |> na.omit()
+
+# Helper to compute summary stats
+summary_stats <- function(x) {
+  data.frame(
+    mean = mean(x),
+    p05  = quantile(x, 0.05),
+    p95  = quantile(x, 0.95)
+  )
+}
+
+stats_tmean <- summary_stats(df$tmean_spring)
+stats_ppt   <- summary_stats(df$ppt_spring)
+
+# --- Plot: Spring Tmean ---
+p1 <- ggplot(df, aes(x = tmean_spring)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 50, fill = "steelblue", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = stats_tmean$mean, color = "black",  linewidth = 1,   linetype = "solid",  label = "Mean") +
+  geom_vline(xintercept = stats_tmean$p05,  color = "firebrick", linewidth = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = stats_tmean$p95,  color = "firebrick", linewidth = 0.8, linetype = "dashed") +
+  annotate("text", x = stats_tmean$mean, y = Inf, label = paste0("Mean: ", round(stats_tmean$mean, 1)),
+           vjust = 2, hjust = -0.1, size = 3.5) +
+  annotate("text", x = stats_tmean$p05, y = Inf, label = "5th",
+           vjust = 2, hjust = -0.1, color = "firebrick", size = 3.5) +
+  annotate("text", x = stats_tmean$p95, y = Inf, label = "95th",
+           vjust = 2, hjust = -0.1, color = "firebrick", size = 3.5) +
+  labs(title = "Distribution of Mean Spring Temperature",
+       x = "Mean Spring Tmean (°C)", y = "Density") +
+  theme_classic()
+
+# --- Plot: Spring PPT ---
+p2 <- ggplot(df, aes(x = ppt_spring)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 50, fill = "darkgreen", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = stats_ppt$mean, color = "black",     linewidth = 1,   linetype = "solid") +
+  geom_vline(xintercept = stats_ppt$p05,  color = "firebrick", linewidth = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = stats_ppt$p95,  color = "firebrick", linewidth = 0.8, linetype = "dashed") +
+  annotate("text", x = stats_ppt$mean, y = Inf, label = paste0("Mean: ", round(stats_ppt$mean, 1)),
+           vjust = 2, hjust = -0.1, size = 3.5) +
+  annotate("text", x = stats_ppt$p05, y = Inf, label = "5th",
+           vjust = 2, hjust = -0.1, color = "firebrick", size = 3.5) +
+  annotate("text", x = stats_ppt$p95, y = Inf, label = "95th",
+           vjust = 2, hjust = -0.1, color = "firebrick", size = 3.5) +
+  labs(title = "Distribution of Total Spring Precipitation",
+       x = "Total Spring PPT (mm)", y = "Density") +
+  theme_classic()
+
+print(p1)
+print(p2)
+
+```
+
+#### Step 3: Create a sampling layer
+
+```{r}
+#| output: true
+# start simple, lets evenly sample cells across space and across flowering distributions
+n_cells_per_year <- 50
+obs_per_cell_range <- c(5,20)
+
+# sample from true pops 
+observed_occs <- cells_true_flowering %>% 
+  group_by(year) %>% 
+  # randomly sample cells 
+  slice_sample(n = n_cells_per_year, replace = FALSE) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate( # randomly determine how many obs within cell
+    n_obs_at_cell = sample(obs_per_cell_range[1]:obs_per_cell_range[2], 1), 
+    # sample flowering from distribution
+    observed_flowering_times = list(sample(cell_flowering_distribution, n_obs_at_cell))
+  ) %>% 
+  ungroup() %>% 
+  tidyr::unnest(observed_flowering_times) %>%  # each row will be an obs
+  rename(flowering_doy_obs = observed_flowering_times)
+
+# visualize sampling 
+# create a spatial plot: 
+observed_occs_sf <- st_as_sf(observed_occs, 
+                                coords = c("X", "Y"), 
+                                crs = crs(tmean_nev))
+
+observed_occs_sf <- observed_occs_sf %>% 
+  distinct(geometry, year, n_obs_at_cell)
+
+obs_flowering_plot <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = observed_occs_sf, mapping = aes(color = n_obs_at_cell), size = 0.5) + 
+  scale_color_viridis_c(option = "magma", direction = +1, name = "Number of Obs") + 
+  ggtitle("Flowering Observation Simu") + 
+  facet_wrap(~year)
+
+obs_flowering_plot 
+
+```
+
+#### Step 4: Group clusters to build phenometric estimates
+
+```{r}
+#| output: true
+## Spatial Clustering
+cluster_spatial <- function(data, distance_km = 50, min_obs = 7, min_cells = 3){
+  data_clustered <- data %>% 
+    group_by(year) %>% 
+    group_modify(~{
+      # get unique cell locs for clustering
+      unique_cells <- .x %>% 
+        distinct(X,Y, .keep_all = TRUE) %>% 
+        dplyr::select(X,Y, tmean_spring, ppt_spring)
+      coords <- as.matrix(unique_cells[, c("X", "Y")])
+      # convert dist to meters
+      eps_m <- distance_km * 1000
+      # DBSCAN clustering on cells, instead of individual obs
+      clusters <- dbscan(coords, eps = eps_m, minPts = min_cells)
+      # add cluster IDs to unique cells
+      unique_cells$cluster_id <- clusters$cluster
+      # join cluster IDs back to all obs
+      .x %>% 
+        left_join(unique_cells %>% dplyr::select(X,Y,cluster_id), by = c("X","Y")) %>% 
+        filter(cluster_id != 0) # removes noise cluster
+    }) %>% 
+    ungroup() %>% 
+    # create unique cluster id across years
+    mutate(cluster_full_id = paste0(year, "_", cluster_id)) %>% 
+    # filter to clusters with min total obs
+    group_by(cluster_full_id) %>% 
+    filter(n() >= min_obs) %>% 
+    # calc spatial metrics per cluster
+    mutate(
+      cluster_n_obs = n(), # total obs in cluster
+      cluster_n_cells = n_distinct(X,Y), # number of cells in cluster
+      # Calc cell level centroids for spatial metrics 
+      cluster_mean_dist_to_center = {
+        cell_coords <- distinct(pick(X,Y))
+        centroid_x <- mean(cell_coords$X)
+        centroid_y <- mean(cell_coords$Y)
+        sqrt(mean((cell_coords$X - centroid_x)^2 + (cell_coords$Y - centroid_y)^2)) / 1000
+      }, 
+      # mean nearest neighbor dist between cells (km)
+      cluster_mean_nn_dist = {
+        cell_coords <- distinct(pick(X, Y))
+        if(nrow(cell_coords) > 1) {
+          coords_mat <- as.matrix(cell_coords)
+          dist_mat <- as.matrix(dist(coords_mat))
+          diag(dist_mat) <- NA
+          mean(apply(dist_mat, 1, min, na.rm = TRUE)) / 1000
+        } else {
+          NA_real_
+        }
+      },
+      
+      # Inverse for weighting (lower distance = higher weight)
+      cluster_compactness = 1 / (cluster_mean_dist_to_center + 0.1)
+    ) %>%
+    ungroup()
+  
+  return(data_clustered)
+}
+
+
+## Environmental Clustering 
+ cluster_env <- function(data, env_range_h = 2, min_obs = 7, min_cells = 3){
+  data_clustered <- data %>%
+    group_by(year) %>%
+    group_modify(~{
+      # get unique cell locations with their env vars
+      unique_cells <- .x %>%
+        distinct(X, Y, .keep_all = TRUE) %>%
+        dplyr::select(X, Y, tmean_spring, ppt_spring)
+      
+      # scale both variables so neither dominates by units
+      env_scaled <- scale(unique_cells[, c("tmean_spring", "ppt_spring")])
+      
+      # run hierarchical clustering on scaled env space
+      env_dist <- dist(env_scaled)
+      hc <- hclust(env_dist, method = "complete")
+      clusters <- cutree(hc, h = env_range_h)
+      
+      unique_cells$cluster_id <- clusters
+      
+      .x %>%
+        left_join(unique_cells %>% dplyr::select(X, Y, cluster_id), by = c("X", "Y"))
+    }) %>%
+    ungroup() %>%
+    mutate(cluster_full_id = paste0(year, "_", cluster_id)) %>%
+    group_by(cluster_full_id) %>%
+    filter(n_distinct(X, Y) >= min_cells,
+           n() >= min_obs) %>%
+    mutate(
+      cluster_n_obs   = n(),
+      cluster_n_cells = n_distinct(X, Y),
+      # Temperature metrics
+      cluster_temp_mean  = {
+        cell_temps <- distinct(pick(X, Y, tmean_spring))$tmean_spring
+        mean(cell_temps)
+      },
+      cluster_temp_sd  = {
+        cell_temps <- distinct(pick(X, Y, tmean_spring))$tmean_spring
+        sd(cell_temps)
+      },
+      cluster_temp_range = {
+        cell_temps <- distinct(pick(X, Y, tmean_spring))$tmean_spring
+        max(cell_temps) - min(cell_temps)
+      },
+      # Precipitation metrics
+      cluster_ppt_mean = {
+        cell_ppts <- distinct(pick(X, Y, ppt_spring))$ppt_spring
+        mean(cell_ppts)
+      },
+      cluster_ppt_sd = {
+        cell_ppts <- distinct(pick(X, Y, ppt_spring))$ppt_spring
+        sd(cell_ppts)
+      },
+      cluster_ppt_range = {
+        cell_ppts <- distinct(pick(X, Y, ppt_spring))$ppt_spring
+        max(cell_ppts) - min(cell_ppts)
+      },
+      # Weight: prefer homogeneous clusters in both dimensions
+      # combines temp and ppt sd so clusters tight in both get higher weight
+      cluster_env_weight = 1 / (cluster_temp_sd + cluster_ppt_sd + 0.1)
+    ) %>%
+    ungroup()
+  return(data_clustered)
+ }
+ 
+obs_spatial_clusters <- cluster_spatial(observed_occs, 
+                                        distance_km = 25, 
+                                        min_obs = 7,     
+                                        min_cells = 2)    
+obs_env_clusters <- cluster_env(observed_occs, 
+                                env_range_h = 2, 
+                                min_obs = 7, 
+                                min_cells = 2)
+
+# Visualize clusters in space
+obs_spatial_clusters_sf <- st_as_sf(obs_spatial_clusters, 
+                                     coords = c("X", "Y"), 
+                                     crs = crs(tmean_nev))
+obs_env_clusters_sf <- st_as_sf(obs_env_clusters, 
+                                     coords = c("X", "Y"), 
+                                     crs = crs(tmean_nev))
+
+ggplot() +
+  geom_sf(data = nevada, fill = "gray90") +
+  geom_sf(data = obs_spatial_clusters_sf, aes(color = factor(cluster_id)), size = 1) +
+  facet_wrap(~year) +
+  labs(color = "Cluster", title = "Spatial Clusters by Year") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = nevada, fill = "gray90") +
+  geom_sf(data = obs_env_clusters_sf, aes(color = factor(cluster_id)), size = 1) +
+  facet_wrap(~year) +
+  labs(color = "Cluster", title = "Temp Env Clusters by Year") +
+  theme_minimal()
+```
+
+#### Step 5: Use phenesse to Calc Onset
+
+```{r}
+#| output: true
+cluster_spatial_onset <- obs_spatial_clusters %>%
+  group_by(cluster_full_id, year, cluster_compactness) %>%
+  summarise(
+    n_obs = n(),
+    onset_estimate = phenesse::quantile_ci(observations = flowering_doy_obs, 
+                                  percentile = 0.10, 
+                                  bootstraps = 250)$estimate,
+    # Also get cluster-level environmental predictors for GAM
+    tmean_spring_mean = mean(tmean_spring),
+    ppt_spring_mean = mean(ppt_spring),
+    X_centroid = mean(X),
+    Y_centroid = mean(Y),
+    .groups = "drop"
+  )  %>% 
+  mutate(weight = cluster_compactness / mean(cluster_compactness)) # normalized
+
+cluster_env_onset <- obs_env_clusters %>%
+  group_by(cluster_full_id, year, cluster_temp_sd) %>%
+  summarise(
+    n_obs = n(),
+    onset_estimate = phenesse::quantile_ci(observations = flowering_doy_obs, 
+                                  percentile = 0.10, 
+                                  bootstraps = 250)$estimate,
+    # Also get cluster-level environmental predictors for GAM
+    tmean_spring_mean = mean(tmean_spring),
+    ppt_spring_mean = mean(ppt_spring),
+    X_centroid = mean(X),
+    Y_centroid = mean(Y),
+    .groups = "drop"
+  )  %>% 
+  mutate(weight = mean(cluster_temp_sd)/cluster_temp_sd)
+
+```
+
+#### Step 6. Model Onset using GAM
+
+```{r}
+#| output: true
+cluster_spatial_onset$cluster_full_id <- as.factor(cluster_spatial_onset$cluster_full_id)
+cluster_env_onset$cluster_full_id <- as.factor(cluster_env_onset$cluster_full_id)
+# run GAM, overkill here.
+gam_spatial <- gam(onset_estimate ~ s(tmean_spring_mean, k = 5) +
+                     s(ppt_spring_mean, k = 7) +
+                     s(cluster_full_id, bs = "re"), 
+                   data = cluster_spatial_onset, 
+                   weights = weight)
+
+gam_env <- gam(onset_estimate ~ s(tmean_spring_mean, k = 7) + 
+                     s(ppt_spring_mean, k = 5) +
+                     s(cluster_full_id, bs = "re"), 
+                   data = cluster_env_onset, 
+                   weights = weight)
+
+# predict 
+cells_true_flowering$predicted_onset_spatial <- predict(gam_spatial, newdata = data.frame(
+                        tmean_spring_mean = cells_true_flowering$tmean_spring,
+                        ppt_spring_mean = cells_true_flowering$ppt_spring), 
+                        exclude = "s(cluster_full_id)",  # Exclude random effect
+                        newdata.guaranteed = TRUE)
+
+cells_true_flowering$predicted_onset_env <- predict(gam_env, newdata = data.frame(
+                        tmean_spring_mean = cells_true_flowering$tmean_spring, 
+                        ppt_spring_mean = cells_true_flowering$ppt_spring), 
+                        exclude = "s(cluster_full_id)",  # Exclude random effect
+                        newdata.guaranteed = TRUE)
+
+
+```
+
+#### Step 7. Calculate MESS metrics
+
+```{r}
+#| output: true
+# predictor vars to check 
+predictor_vars <- c("tmean_spring", "ppt_spring") 
+
+# set-up training data (empirical data) for the models
+training_cells_spatial <- obs_spatial_clusters %>% 
+  distinct(X, Y, .keep_all = TRUE)
+training_cells_env <- obs_env_clusters %>% 
+  distinct(X, Y, .keep_all = TRUE)
+
+# MESS per var
+
+for(v in 1:length(predictor_vars)){
+  var_name <- predictor_vars[v]
+  
+  # Spatial
+  low  <- min(training_cells_spatial[[var_name]], na.rm = TRUE)
+  high <- max(training_cells_spatial[[var_name]], na.rm = TRUE)
+  cells_true_flowering[[paste0("mess_spatial_", var_name)]] <-
+    ifelse(cells_true_flowering[[var_name]] < low | cells_true_flowering[[var_name]] > high, 0, 1)
+  cells_true_flowering[[paste0("mess_dist_spatial_", var_name)]] <-
+    ifelse(cells_true_flowering[[paste0("mess_spatial_", var_name)]] == 1, 0,
+           pmin(abs(cells_true_flowering[[var_name]] - low),
+                abs(cells_true_flowering[[var_name]] - high)))
+  
+  # Environmental
+  low  <- min(training_cells_env[[var_name]], na.rm = TRUE)
+  high <- max(training_cells_env[[var_name]], na.rm = TRUE)
+  cells_true_flowering[[paste0("mess_env_", var_name)]] <-
+    ifelse(cells_true_flowering[[var_name]] < low | cells_true_flowering[[var_name]] > high, 0, 1)
+  cells_true_flowering[[paste0("mess_dist_env_", var_name)]] <-
+    ifelse(cells_true_flowering[[paste0("mess_env_", var_name)]] == 1, 0,
+           pmin(abs(cells_true_flowering[[var_name]] - low),
+                abs(cells_true_flowering[[var_name]] - high)))
+}
+
+## Combine MESS interpolations only if in range of both vars
+cells_true_flowering <- cells_true_flowering %>%
+  mutate(
+    # 1 only if interpolating in both temp and ppt
+    mess_spatial_combined = as.integer(mess_spatial_tmean_spring == 1 & mess_spatial_ppt_spring == 1),
+    mess_env_combined     = as.integer(mess_env_tmean_spring     == 1 & mess_env_ppt_spring     == 1),
+    # total extrapolation distance as euclidean distance across both vars
+    mess_dist_spatial_combined = sqrt(mess_dist_spatial_tmean_spring^2 + mess_dist_spatial_ppt_spring^2),
+    mess_dist_env_combined     = sqrt(mess_dist_env_tmean_spring^2     + mess_dist_env_ppt_spring^2)
+  )
+
+## Plot fxn
+plot_mess <- function(mess_sf, dist_col, title, file){
+  max_val <- max(mess_sf[[dist_col]], na.rm = TRUE)
+  p <- ggplot() +
+    geom_sf(data = nevada, fill = "gray90", color = "black") +
+    geom_sf(data = species_range, fill = NA, color = "black", size = 1) +
+    geom_sf(data = mess_sf, mapping = aes(color = .data[[dist_col]]), size = 0.5) +
+    scale_color_gradientn(
+      colors = c("darkgreen", "yellow", "darkred"),
+      values = scales::rescale(c(0, 0.001, max_val)),
+      name = "Extrapolation\nDistance"
+    ) +
+    facet_wrap(~year) +
+    ggtitle(title) +
+    theme_bw()
+  print(p)
+  ggsave(plot = p, file = file, width = 15, height = 15)
+}
+
+mess_sf <- st_as_sf(cells_true_flowering, coords = c("X","Y"), crs = crs(tmean_nev))
+
+# Spatial model plots
+plot_mess(mess_sf, "mess_dist_spatial_tmean_spring",
+          "MESS: tmean_spring (Spatial Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-spatial-tmean.png")
+
+plot_mess(mess_sf, "mess_dist_spatial_ppt_spring",
+          "MESS: ppt_spring (Spatial Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-spatial-ppt.png")
+
+plot_mess(mess_sf, "mess_dist_spatial_combined",
+          "MESS: Combined (Spatial Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-spatial-combined.png")
+
+# Environmental model plots
+plot_mess(mess_sf, "mess_dist_env_tmean_spring",
+          "MESS: tmean_spring (Environmental Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-env-tmean.png")
+
+plot_mess(mess_sf, "mess_dist_env_ppt_spring",
+          "MESS: ppt_spring (Environmental Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-env-ppt.png")
+
+plot_mess(mess_sf, "mess_dist_env_combined",
+          "MESS: Combined (Environmental Clustering)",
+          "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/MESS-env-combined.png")
+```
+
+#### Step 8. Calc Preformance Metrics
+
+```{r}
+#| output: true
+#### Step 8: Error Analysis by Interpolation/Extrapolation Status
+
+# --- Calculate absolute error for each model ---
+cells_true_flowering <- cells_true_flowering %>%
+  mutate(
+    error_spatial = predicted_onset_spatial - cell_flowering_onset,
+    error_env     = predicted_onset_env     - cell_flowering_onset,
+    abs_error_spatial = abs(error_spatial),
+    abs_error_env     = abs(error_env),
+    # Use combined status since both vars drive the model
+    interp_status_spatial = ifelse(mess_spatial_combined == 1, "Interpolation", "Extrapolation"),
+    interp_status_env     = ifelse(mess_env_combined     == 1, "Interpolation", "Extrapolation")
+  )
+
+# --- Plot 1: Absolute error by interpolation status (boxplot) ---
+error_long <- cells_true_flowering %>%
+  dplyr::select(year, abs_error_spatial, abs_error_env,
+                interp_status_spatial, interp_status_env) %>%
+  tidyr::pivot_longer(
+    cols = c(abs_error_spatial, abs_error_env),
+    names_to = "model",
+    values_to = "abs_error"
+  ) %>%
+  mutate(
+    interp_status = ifelse(model == "abs_error_spatial", interp_status_spatial, interp_status_env),
+    model = recode(model,
+                   "abs_error_spatial" = "Spatial Clustering",
+                   "abs_error_env"     = "Environmental Clustering")
+  )
+
+error_box_plot <- ggplot(error_long, aes(x = interp_status, y = abs_error, fill = interp_status)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Interpolation" = "darkgreen", "Extrapolation" = "darkred")) +
+  facet_grid(model ~ year) +
+  labs(x = NULL, y = "Absolute Error (DOY)",
+       title = "Prediction Error: Interpolation vs. Extrapolation (Combined MESS)",
+       fill = "Status") +
+  theme_bw()
+print(error_box_plot)
+ggsave(plot = error_box_plot,
+       file = "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/error-by-interp-status.png",
+       width = 15, height = 8)
+
+# --- Plot 2: Response curves for temp, colored by combined interp status ---
+true_curve <- data.frame(tmean_spring = seq(
+  min(cells_true_flowering$tmean_spring, na.rm = TRUE),
+  max(cells_true_flowering$tmean_spring, na.rm = TRUE),
+  length.out = 200
+)) %>%
+  mutate(true_onset = qnorm(0.10,
+                            mean = params$intercept + params$temp_slope * tmean_spring,
+                            sd = params$sigma_individual))
+
+response_curve_spatial <- ggplot(cells_true_flowering,
+                                  aes(x = tmean_spring, y = predicted_onset_spatial,
+                                      color = interp_status_spatial)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_line(data = true_curve, aes(x = tmean_spring, y = true_onset),
+            color = "black", linewidth = 1.2, inherit.aes = FALSE) +
+  scale_color_manual(values = c("Interpolation" = "darkgreen", "Extrapolation" = "darkred")) +
+  facet_wrap(~year) +
+  labs(x = "Mean Spring Temperature (°C)", y = "Flowering Onset (DOY)",
+       title = "Spatial Model: Predicted vs True Response (temp)",
+       color = "Status") +
+  theme_bw()
+
+response_curve_env <- ggplot(cells_true_flowering,
+                              aes(x = tmean_spring, y = predicted_onset_env,
+                                  color = interp_status_env)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_line(data = true_curve, aes(x = tmean_spring, y = true_onset),
+            color = "black", linewidth = 1.2, inherit.aes = FALSE) +
+  scale_color_manual(values = c("Interpolation" = "darkgreen", "Extrapolation" = "darkred")) +
+  facet_wrap(~year) +
+  labs(x = "Mean Spring Temperature (°C)", y = "Flowering Onset (DOY)",
+       title = "Environmental Model: Predicted vs True Response (temp)",
+       color = "Status") +
+  theme_bw()
+
+# --- Plot 3: ppt response curves ---
+# true ppt effect at median temp
+median_temp <- median(cells_true_flowering$tmean_spring, na.rm = TRUE)
+true_curve_ppt <- data.frame(ppt_spring = seq(
+  min(cells_true_flowering$ppt_spring, na.rm = TRUE),
+  max(cells_true_flowering$ppt_spring, na.rm = TRUE),
+  length.out = 200
+)) %>%
+  rowwise() %>%
+  mutate(
+    ppt_penalty = if(ppt_spring < params$ppt_min){
+      params$ppt_max_penalty
+    } else if(ppt_spring > params$ppt_max){
+      min(((ppt_spring - params$ppt_max) / params$ppt_max) * params$ppt_max_penalty,
+          params$ppt_max_penalty)
+    } else {
+      0
+    },
+    true_onset = qnorm(0.10,
+                       mean = params$intercept + params$temp_slope * median_temp + ppt_penalty,
+                       sd = params$sigma_individual)
+  ) %>%
+  ungroup()
+
+ppt_curve_spatial <- ggplot(cells_true_flowering,
+                             aes(x = ppt_spring, y = predicted_onset_spatial,
+                                 color = interp_status_spatial)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_line(data = true_curve_ppt, aes(x = ppt_spring, y = true_onset),
+            color = "black", linewidth = 1.2, inherit.aes = FALSE) +
+  scale_color_manual(values = c("Interpolation" = "darkgreen", "Extrapolation" = "darkred")) +
+  facet_wrap(~year) +
+  labs(x = "Cumulative Spring PPT (mm)", y = "Flowering Onset (DOY)",
+       title = "Spatial Model: Predicted vs True Response (ppt)",
+       color = "Status") +
+  theme_bw()
+
+ppt_curve_env <- ggplot(cells_true_flowering,
+                         aes(x = ppt_spring, y = predicted_onset_env,
+                             color = interp_status_env)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_line(data = true_curve_ppt, aes(x = ppt_spring, y = true_onset),
+            color = "black", linewidth = 1.2, inherit.aes = FALSE) +
+  scale_color_manual(values = c("Interpolation" = "darkgreen", "Extrapolation" = "darkred")) +
+  facet_wrap(~year) +
+  labs(x = "Cumulative Spring PPT (mm)", y = "Flowering Onset (DOY)",
+       title = "Environmental Model: Predicted vs True Response (ppt)",
+       color = "Status") +
+  theme_bw()
+
+combined_response <- (response_curve_spatial / response_curve_env) |
+                     (ppt_curve_spatial / ppt_curve_env)
+ggsave(plot = combined_response,
+       file = "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/response-curves-interp-status.png",
+       width = 20, height = 12)
+print(combined_response)
+
+# --- Summary table ---
+error_summary <- error_long %>%
+  group_by(model, interp_status, year) %>%
+  summarise(
+    mean_abs_error   = round(mean(abs_error, na.rm = TRUE), 2),
+    median_abs_error = round(median(abs_error, na.rm = TRUE), 2),
+    n_cells = n(),
+    .groups = "drop"
+  )
+print(error_summary)
+
+plot(gam_spatial)
+plot(gam_env)
+```
+
+Compare GAM to true model fit
+
+```{r}
+#| output: true
+# --- Build prediction grid over observed predictor ranges ---
+pred_grid <- expand.grid(
+  tmean_spring_mean = seq(min(cells_true_flowering$tmean_spring, na.rm = TRUE),
+                          max(cells_true_flowering$tmean_spring, na.rm = TRUE),
+                          length.out = 100),
+  ppt_spring_mean   = c(20, 30, 55, 95)  # same ppt scenarios as response curve viz
+) %>%
+  mutate(ppt_label = factor(ppt_spring_mean,
+                             levels = c(20, 30, 55, 95),
+                             labels = c("Drought (<25mm)", "Adequate (30mm)",
+                                        "Optimal (55mm)", "Excess (>85mm)")))
+
+# --- Get GAM predictions with SE ---
+pred_grid$predicted_spatial <- predict(gam_spatial,
+                                        newdata = pred_grid,
+                                        exclude = "s(cluster_full_id)",
+                                        newdata.guaranteed = TRUE,
+                                        se.fit = FALSE)
+pred_grid$predicted_env <- predict(gam_env,
+                                    newdata = pred_grid,
+                                    exclude = "s(cluster_full_id)",
+                                    newdata.guaranteed = TRUE,
+                                    se.fit = FALSE)
+
+# --- Build true curve for same grid ---
+pred_grid <- pred_grid %>%
+  rowwise() %>%
+  mutate(
+    ppt_penalty = if(ppt_spring_mean < params$ppt_min){
+      params$ppt_max_penalty
+    } else if(ppt_spring_mean > params$ppt_max){
+      min(((ppt_spring_mean - params$ppt_max) / params$ppt_max) * params$ppt_max_penalty,
+          params$ppt_max_penalty)
+    } else {
+      0
+    },
+    true_onset = qnorm(0.10,
+                       mean = params$intercept + params$temp_slope * tmean_spring_mean + ppt_penalty,
+                       sd = params$sigma_individual)
+  ) %>%
+  ungroup()
+
+# --- Pivot to long for faceted plotting ---
+pred_long <- pred_grid %>%
+  tidyr::pivot_longer(cols = c(predicted_spatial, predicted_env, true_onset),
+               names_to = "source",
+               values_to = "onset") %>%
+  mutate(source = recode(source,
+                         "predicted_spatial" = "GAM (Spatial)",
+                         "predicted_env"     = "GAM (Environmental)",
+                         "true_onset"        = "True Response"))
+
+# --- Plot ---
+gam_vs_true <- ggplot(pred_long, aes(x = tmean_spring_mean, y = onset,
+                                      color = source, linetype = source)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("GAM (Spatial)"       = "steelblue",
+                                 "GAM (Environmental)" = "darkorange",
+                                 "True Response"            = "black")) +
+  scale_linetype_manual(values = c("GAM (Spatial)"       = "dashed",
+                                    "GAM (Environmental)" = "dashed",
+                                    "True Response"            = "solid")) +
+  facet_wrap(~ppt_label) +
+  labs(x = "Mean Spring Temperature (°C)", y = "Flowering Onset (DOY)",
+       title = "GAM Estimated vs True Response Curve",
+       color = "Source", linetype = "Source") +
+  theme_bw()
+
+print(gam_vs_true)
+```

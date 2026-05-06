@@ -1,0 +1,507 @@
+---
+title: "simu-data"
+author: "JT Miller"
+format: html
+editor: visual
+---
+
+## Simulate Pheno Extraction and Interpolation Across a species Range
+
+### Methods
+
+Load Packages
+
+```{r}
+library(rnaturalearth)
+library(sf)
+library(ggplot2)
+library(terra)
+library(dplyr)
+library(patchwork)
+library(dbscan)
+library(mgcv)
+```
+
+#### Step 1: Create Nevada Phenology Simulation with Daymet climate Data
+
+```{r}
+# get nevada boundary
+nevada <- ne_states(country = "United States of America", 
+                    returnclass = "sf") %>% filter(name == "Nevada")
+
+```
+
+```{r}
+# Path to Daymet data
+daymet_path <- "/orange/guralnick/daymet-daily/"
+
+# Function to extract Nevada data from Daymet NetCDF
+extract_nevada_daymet <- function(variable, years) {
+  
+  climate_list <- list()
+  
+  for(year in years) {
+    # Load NetCDF file
+    nc_file <- file.path(daymet_path, 
+                         paste0("daymet_v4_daily_na_", variable, "_", year, ".nc"))
+    climate_rast <- rast(nc_file)
+    
+    # Reproject Nevada to match Daymet CRS
+    nevada_reproj <- st_transform(nevada, crs(climate_rast))
+    nevada_vect <- vect(nevada_reproj)
+    
+    # Crop and mask to Nevada
+    climate_nv <- crop(climate_rast, nevada_vect, mask = TRUE)
+    
+    climate_list[[as.character(year)]] <- climate_nv
+  }
+  
+  # Combine all years
+  climate_all <- do.call(c, climate_list)
+  
+  return(climate_all)
+}
+
+# Extract data for 2017-2020
+years <- 2017:2020
+tmin_nv <- extract_nevada_daymet("tmin", years)
+tmax_nv <- extract_nevada_daymet("tmax", years)
+prcp_nv <- extract_nevada_daymet("prcp", years)
+
+# combine elements into a singular raster
+tmin_nv_comined <- rast(tmin_nv)
+tmax_nv_comined <- rast(tmax_nv)
+prcp_nv_comined <- rast(prcp_nv)
+
+# additionally calc tmean from tmin and tmax 
+tmean_nv <- (tmin_nv_comined + tmax_nv_comined)/2
+
+# Save for later use
+writeRaster(tmin_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif", overwrite = TRUE)
+writeRaster(tmax_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmax_2017_2020_daymet.tif", overwrite = TRUE)
+writeRaster(prcp_nv_comined, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_prcp_2017_2020_daymet.tif", overwrite = TRUE)
+writeRaster(tmean_nv, "/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmean_2017_2020_daymet.tif", overwrite = TRUE)
+
+```
+
+Read in Raster Stack
+
+```{r}
+tmin_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif")
+tmax_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmin_2017_2020_daymet.tif")
+tmean_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_tmean_2017_2020_daymet.tif")
+ppt_nev <- terra::rast("/blue/guralnick/millerjared/PhenoInterpolate/data/processed/clim-layers/nevada_prcp_2017_2020_daymet.tif")
+```
+
+Create a fake species range
+
+```{r}
+nevada_bbox <- st_bbox(nevada)
+
+species_range <- st_polygon(list(cbind(
+                        c(-120, -119, -117, -115, -116, -118, -120), # lons
+                        c(36, 39, 41, 39.5, 37, 35.5, 36)))) %>% #lats
+  st_sfc(crs = st_crs(nevada)) %>% 
+  st_sf() %>% 
+  st_intersection(nevada) # clip to nev boundary
+
+ggplot() + 
+  geom_sf(data = nevada, mapping = aes(), fill = "lightgray") + 
+  geom_sf(data = species_range, mapping = aes(), fill = "darkgreen", alpha = 0.5) + 
+  theme_bw() + 
+  ggtitle("Species S Distribution in Nevada")
+```
+
+#### Step 2: Set-up flowering Response
+
+```{r}
+## Create a true data generating process
+params <- list(
+  intercept = 170,      # flowering DOY when temp = 0°C
+  temp_slope = -3.5,    # days earlier per 1°C increase
+  sigma = 0            # within-site SD
+)
+
+# True flowering DOY function (linear only)
+true_flowering_mu <- function(temp, par = params){
+  mu <- par$intercept + par$temp_slope * temp
+  return(mu)
+}
+
+# Visualize the response curve
+temp_range <- seq(0, 25, by = 0.1)
+flowering_doy <- true_flowering_mu(temp_range)
+response_df <- data.frame(temp_range, flowering_doy)
+
+ggplot(response_df, mapping = aes(x = temp_range, y = flowering_doy)) +
+  geom_line(size = 1.2, color = "darkred") +
+  labs(x = "Mean Spring Temperature (°C)", 
+       y = "Flowering Onset (DOY)",
+       title = "True Flowering Response to Temperature") +
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+```
+
+Match up species range with climate, then simu spring flowering
+
+```{r}
+
+# reproj species range to match clim data
+species_range_clim <- st_transform(species_range, crs = crs(tmean_nev))
+
+# create a point for each 1km cell center within the species range (res of daymet clim layer)
+tmean_species <- crop(tmean_nev, vect(species_range_clim), mask = TRUE)
+ppt_species <- crop(ppt_nev, vect(species_range_clim), mask = TRUE)
+# extract cell centers as pts 
+cells <- cells(tmean_species[[1]]) # get cell numbers
+cell_coords <- xyFromCell(tmean_species[[1]], cells)
+occ_pts <- st_as_sf(data.frame(cell_coords), 
+                    coords = c("x", "y"), 
+                    crs = crs(tmean_nev))
+
+# calc spring clim at each point
+spring_layers <- 30:150 # Feb-May
+tmean_spring <- mean(tmean_species[[spring_layers]])
+ppt_spring <- sum(ppt_species[[spring_layers]])
+
+# extract clim vals at each occ pt 
+climate_data <- terra::extract(c(tmean_spring, ppt_spring), 
+                               vect(occ_pts))
+
+# calc TRUE flowering DOY for simulation occurrences
+true_occurrences <- occ_pts %>% 
+  st_drop_geometry() %>% 
+  bind_cols(st_coordinates(occ_pts)) %>% 
+  mutate(
+    tmean_spring = climate_data$mean,
+    ppt_spring = climate_data$sum, 
+    flowering_doy_mu = true_flowering_mu(tmean_spring, par = params), # TRUE flowering by expected rules
+    flowering_doy = rnorm(n(), flowering_doy_mu, params$sigma), # TRUE flowering by allowing SD
+    year = 2017
+  )
+
+# vis against response
+
+ggplot() +
+  geom_point(true_occurrences, mapping = aes(x = tmean_spring, y = flowering_doy)) +
+  geom_line(response_df, mapping = aes(x = temp_range, y = flowering_doy), size = 1.2, color = "darkred", alpha = 0.1) +
+  labs(x = "Mean Spring Temperature (°C)", 
+       y = "Flowering Onset (DOY)",
+       title = "True Flowering Response to Temperature") +
+  theme_bw() +
+  theme(text = element_text(size = 14))
+
+ggsave("/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/true-fl-response-curve.png")
+
+
+# create a spatial plot: 
+true_occurrences_sf <- st_as_sf(true_occurrences, 
+                                coords = c("X", "Y"), 
+                                crs = crs(tmean_nev))
+
+true_flowering_plot <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = true_occurrences_sf, mapping = aes(color = flowering_doy), size = 0.5) + 
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Flowering\nDOY") + 
+  ggtitle("True Flowering DOY Across Species Range")
+
+temp_plot <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = true_occurrences_sf, mapping = aes(color = tmean_spring), size = 0.5) + 
+  scale_color_viridis_c(option = "plasma", name = "Mean Spring Temp") + 
+  ggtitle("Mean Spring Temperature Across Species Range")
+
+combined_plot <- true_flowering_plot + temp_plot
+
+ggsave(plot = combined_plot, "/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/nev-sp-simu-map-plots.png", width = 15, height = 10)
+print(combined_plot)
+
+
+## Do this for each year 
+years <- 2017:2020
+days_per_year <- c(365,365,365,366)
+spring_doy <- 30:150
+
+# calc cumulative yera positions 
+year_starts <- c(1, cumsum(days_per_year[-length(days_per_year)]) + 1)
+names(year_starts) <- years
+
+# genearte true occurrences for all years
+true_occurrences_all <- list()
+for(i in seq_along(years)){
+  # get year and when year starts in raster
+  year <- years[i]
+  year_start <- year_starts[i]
+  # get spring layers for this year
+  spring_layers_year <- (year_start - 1) + spring_doy
+  # calc spring climate for this year
+  tmean_spring <- mean(tmean_species[[spring_layers_year]])
+  ppt_spring <- sum(ppt_species[[spring_layers_year]])
+  # extract clim vals 
+  climate_data <- terra::extract(c(tmean_spring, ppt_spring), vect(occ_pts))
+  # generate occs for this year
+  true_occurrences_year <- occ_pts %>% 
+    st_drop_geometry() %>% 
+    bind_cols(st_coordinates(occ_pts)) %>% 
+    mutate(
+      tmean_spring = climate_data$mean, 
+      ppt_spring = climate_data$sum, 
+       flowering_doy_mu = true_flowering_mu(tmean_spring, par = params), # TRUE flowering by expected rules
+    flowering_doy = rnorm(n(), flowering_doy_mu, params$sigma), # TRUE flowering by allowing SD
+    year = year)
+  
+  true_occurrences_all[[as.character(year)]] <- true_occurrences_year
+  
+}
+
+# combine all years
+true_occurrences <- bind_rows(true_occurrences_all)
+
+true_flowering_plot_all <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = true_occurrences_sf, mapping = aes(color = flowering_doy), size = 0.5) + 
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Flowering\nDOY") + 
+  ggtitle("True Flowering DOY Across Species Range")
+
+```
+
+#### Step 3: Create a sampling layer
+
+```{r}
+# simple, make even sampling per year
+n_per_year <- 250 
+
+# sample evenly across years
+observed_occs <- true_occurrences %>% 
+  group_by(year) %>% 
+  slice_sample(n = n_per_year, replace = FALSE) %>% 
+  ungroup()
+
+
+# visualize sampling 
+# create a spatial plot: 
+observed_occs_sf <- st_as_sf(observed_occs, 
+                                coords = c("X", "Y"), 
+                                crs = crs(tmean_nev))
+
+true_flowering_plot <- ggplot() + 
+  geom_sf(data = nevada, fill = "gray90", color = "black") + 
+  geom_sf(data = species_range, fill = NA, color = "black", size = 1) + 
+  geom_sf(data = observed_occs_sf, mapping = aes(color = flowering_doy), size = 0.5) + 
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Flowering\nDOY") + 
+  ggtitle("True Flowering DOY Across Species Range") + 
+  facet_wrap(~year)
+
+true_flowering_plot 
+
+ggplot() +
+  geom_point(data = true_occurrences, aes(x = tmean_spring, y = flowering_doy), 
+             color = "black", alpha = 0.2, size = 0.5) +
+  geom_point(data = observed_occs, aes(x = tmean_spring, y = flowering_doy) ,color = "steelblue", 
+             alpha = 0.6) +
+  geom_line(data = response_df, aes(x = temp_range, y = flowering_doy), 
+            color = "darkred", size = 1.2, alpha = 0.1) +
+  labs(x = "Mean Spring Temperature (°C)",
+       y = "Flowering Onset (DOY)",
+       color = "Year",
+       title = "Observed Occurrences (blue) vs True Population (black)") +
+  theme_bw() + 
+  facet_wrap(~year)
+
+```
+
+#### Step 4: Group clusters to build phenometric estimates
+
+```{r}
+# use dbscan to group clusters by year
+cluster_list <- list()
+
+for(i in unique(observed_occs$year)){
+  # make a spatial dataset
+  yr_df <- observed_occs %>% dplyr::filter(year == i)
+  yr_df_sf <- yr_df %>% st_as_sf(coords = c("X", "Y"), crs = st_crs(tmean_nev))
+  yr_df_sf <- yr_df_sf %>% st_transform(crs = 5070) # equal area proj Albers
+  # extract coords
+  coords <- st_coordinates(yr_df_sf)
+  # use hierarchical dbscan, just requires num pts we need for phenometrics
+  cl <- hdbscan(coords, minPts = 7)
+  yr_df_sf$cluster_id <- cl$cluster # the id 
+  yr_df_sf$cluster_prob <- cl$membership_prob # the clusters support val
+  cluster_list[[as.character(i)]] <- yr_df_sf
+}
+
+# view clusters
+plot_df <- cluster_list[["2017"]] %>% 
+  mutate(cluster_id = factor(cluster_id))
+
+ggplot(plot_df) + 
+  geom_sf(aes(color = cluster_id), size = 1.5, alpha = 0.8) + 
+  guides(color = guide_legend(title = "Cluster ID")) + 
+  theme_bw()
+
+## Spatial Clustering
+cluster_spatial <- function(data, distance_km = 50, min_obs = 7){
+  data_clustered <- data %>% 
+    group_by(year) %>% 
+    group_modify(~ {
+      coords <- as.matrix(.x[, c("X", "Y")])
+      # convert distance to meters
+      eps_m <- distance_km * 1000
+      # DBSCAN clustering 
+      clusters <- dbscan(coords, eps = eps_m, minPts = min_obs)
+      .x %>% 
+        mutate(cluster_id = clusters$cluster) %>% 
+        filter(cluster_id != 0) # removes pts IDed as noise
+    }) %>% 
+    ungroup() %>% 
+    # create unique cluster ID across years
+    mutate(cluster_full_id = paste0(year, "_", cluster_id)) %>% 
+    # filter to clusters with minimum obs
+    group_by(cluster_full_id) %>% 
+    filter(n() >= min_obs) %>% 
+    # calc spatial area per cluster
+     mutate(
+      cluster_n = n(),
+      # Mean distance to cluster centroid (km) - LOWER = denser
+      cluster_mean_dist_to_center = sqrt(mean((X - mean(X))^2 + (Y - mean(Y))^2)) / 1000,
+      # Mean nearest neighbor distance (km) - LOWER = denser
+      cluster_mean_nn_dist = {
+        coords_mat <- as.matrix(data.frame(X = X, Y = Y))
+        dist_mat <- as.matrix(dist(coords_mat))
+        diag(dist_mat) <- NA  # Exclude self-distance
+        mean(apply(dist_mat, 1, min, na.rm = TRUE)) / 1000
+      },
+      # Inverse for weighting (lower distance = higher weight)
+      cluster_compactness = 1 / (cluster_mean_dist_to_center + 0.1)
+    ) %>%
+    ungroup()
+  
+  return(data_clustered)
+}
+
+## Environmental Clustering 
+cluster_env <- function(data, temp_range_c = 2, min_obs = 7){
+  data_clustered <- data %>% 
+    group_by(year) %>% 
+    group_modify(~{
+      # run hierarchical clustering on temp
+      temp_dist <- dist(.x$tmean_spring)
+      hc <- hclust(temp_dist, method = "complete")
+      # cut tree to get clusters with max temp_range_c difference
+      clusters <- cutree(hc, h = temp_range_c)
+      .x %>% 
+        mutate(cluster_id = clusters)
+    }) %>% 
+    ungroup() %>% 
+    # create unique cluster IDs across years
+    mutate(cluster_full_id = paste0(year, "_", cluster_id)) %>% 
+    # Filter to clusters with min obs
+    group_by(cluster_full_id) %>% 
+    filter(n() >= min_obs) %>% 
+    # Calculate environmental variation per cluster
+    mutate(
+      cluster_n = n(),
+      cluster_temp_sd = sd(tmean_spring),
+      cluster_temp_range = max(tmean_spring) - min(tmean_spring),
+      cluster_temp_cv = sd(tmean_spring) / abs(mean(tmean_spring))
+    ) %>%
+    ungroup()
+  
+  return(data_clustered)
+}
+obs_spatial_clusters <- cluster_spatial(observed_occs, distance_km = 25, min_obs = 7)
+obs_env_clusters <- cluster_env(observed_occs, temp_range_c = 2, min_obs = 7)
+
+# Visualize clusters in space
+obs_spatial_clusters_sf <- st_as_sf(obs_spatial_clusters, 
+                                     coords = c("X", "Y"), 
+                                     crs = crs(tmean_nev))
+obs_env_clusters_sf <- st_as_sf(obs_env_clusters, 
+                                     coords = c("X", "Y"), 
+                                     crs = crs(tmean_nev))
+
+ggplot() +
+  geom_sf(data = nevada, fill = "gray90") +
+  geom_sf(data = obs_spatial_clusters_sf, aes(color = factor(cluster_id)), size = 1) +
+  facet_wrap(~year) +
+  labs(color = "Cluster", title = "Spatial Clusters by Year") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = nevada, fill = "gray90") +
+  geom_sf(data = obs_env_clusters_sf, aes(color = factor(cluster_id)), size = 1) +
+  facet_wrap(~year) +
+  labs(color = "Cluster", title = "Temp Env Clusters by Year") +
+  theme_minimal()
+```
+
+#### Step 5: Use phenesse to Calc Onset
+
+```{r}
+cluster_spatial_onset <- obs_spatial_clusters %>%
+  group_by(cluster_full_id, year, cluster_compactness) %>%
+  summarise(
+    n_obs = n(),
+    onset_estimate = phenesse::quantile_ci(observations = flowering_doy, 
+                                  percentile = 0.10, 
+                                  bootstraps = 250)$estimate,
+    # Also get cluster-level environmental predictors for GAM
+    tmean_spring_mean = mean(tmean_spring),
+    ppt_spring_mean = mean(ppt_spring),
+    X_centroid = mean(X),
+    Y_centroid = mean(Y),
+    .groups = "drop"
+  )  %>% 
+  mutate(weight = cluster_compactness / mean(cluster_compactness)) # normalized
+
+cluster_env_onset <- obs_env_clusters %>%
+  group_by(cluster_full_id, year, cluster_temp_sd) %>%
+  summarise(
+    n_obs = n(),
+    onset_estimate = phenesse::quantile_ci(observations = flowering_doy, 
+                                  percentile = 0.10, 
+                                  bootstraps = 250)$estimate,
+    # Also get cluster-level environmental predictors for GAM
+    tmean_spring_mean = mean(tmean_spring),
+    ppt_spring_mean = mean(ppt_spring),
+    X_centroid = mean(X),
+    Y_centroid = mean(Y),
+    .groups = "drop"
+  )  %>% 
+  mutate(weight = mean(cluster_temp_sd)/cluster_temp_sd)
+
+```
+
+#### Step 6. Model Onset using GAM
+
+```{r}
+cluster_spatial_onset$cluster_full_id <- as.factor(cluster_spatial_onset$cluster_full_id)
+cluster_env_onset$cluster_full_id <- as.factor(cluster_env_onset$cluster_full_id)
+# run GAM, overkill here.
+gam_spatial <- gam(onset_estimate ~ s(tmean_spring_mean, k = 5) + 
+                     s(cluster_full_id, bs = "re"), 
+                   data = cluster_spatial_onset, 
+                   weights = weight)
+
+gam_env <- gam(onset_estimate ~ s(tmean_spring_mean, k = 5) + 
+                     s(cluster_full_id, bs = "re"), 
+                   data = cluster_env_onset, 
+                   weights = weight)
+
+# predict 
+true_occurrences$predicted_onset_spatial <- predict(gam_spatial, newdata = data.frame(
+                        tmean_spring_mean = true_occurrences$tmean_spring), 
+                        exclude = "s(cluster_full_id)",  # Exclude random effect
+                        newdata.guaranteed = TRUE)
+
+true_occurrences$predicted_onset_env <- predict(gam_env, newdata = data.frame(
+                        tmean_spring_mean = true_occurrences$tmean_spring), 
+                        exclude = "s(cluster_full_id)",  # Exclude random effect
+                        newdata.guaranteed = TRUE)
+
+
+```
