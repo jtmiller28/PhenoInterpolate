@@ -1808,13 +1808,13 @@ model_baseline_phenology_w_offset <- function(target_taxa,
   
   #### ONSET ENV MODEL ######################################################################################
   if(nrow(phen_estimate) > 3){ # min req to make env
-    predictors <- c("hopkins_delay_midpoint", "avg_temp", "avg_diurnal_temp_range", "isothermality",
+    predictors <- c("avg_temp", "avg_diurnal_temp_range", "isothermality",
                     "temp_seas", "tmax", "tmin", "annual_temp_range",
                     "avg_monthly_temp_wettest_q", "avg_monthly_temp_driest_q",
                     "avg_monthly_temp_warmest_q", "avg_monthly_temp_coldest_q",
                     "annual_precip", "precip_wettest_month", "precip_driest_month",
                     "precip_seas", "avg_monthly_precip_wettest_q", "avg_monthly_precip_driest_q",
-                    "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q")
+                    "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q") # removed hopkins_delay_midpoint...maybe a bad idea?
     
     # Scale predictors using scale()
     phen_estimate_scaled <- phen_estimate
@@ -1858,9 +1858,9 @@ model_baseline_phenology_w_offset <- function(target_taxa,
         max_vif <- max(vif_results$VIF)
         passes_vif <- all(vif_results$VIF < vif_threshold)
         
-        if(!passes_vif){
-          cat("Excluding model with predictors:", paste(names(coef(best_model))[-1], collapse = ", "),
-              "- Max VIF =", round(max_vif, 2), "\n")
+        if(!passes_vif){ # lots of text, was useful while testing.
+          # cat("Excluding model with predictors:", paste(names(coef(best_model))[-1], collapse = ", "), 
+          #     "- Max VIF =", round(max_vif, 2), "\n")
         }
       }
       
@@ -2094,7 +2094,7 @@ model_baseline_phenology_w_offset <- function(target_taxa,
   
   ### OFFSET ENV MODEL ##########################################################################
   if(nrow(phen_estimate) > 3){ # min req to make env
-    predictors <- c("hopkins_delay_midpoint", "onset", "avg_pet_window", "sd_pet_window", "slope_pet_window", 
+    predictors <- c("onset", "avg_pet_window", "sd_pet_window", "slope_pet_window", 
                     "avg_tasmax_window","sd_tasmax_window", "slope_tasmax_window","avg_tasmin_window",           
                     "sd_tasmin_window", "slope_tasmin_window", "avg_sfcWind_window","sd_sfcWind_window", "slope_sfcWind_window", 
                     "avg_pr_window","sd_pr_window", "slope_pr_window", 
@@ -2104,7 +2104,7 @@ model_baseline_phenology_w_offset <- function(target_taxa,
                     "avg_monthly_temp_warmest_q", "avg_monthly_temp_coldest_q",
                     "annual_precip", "precip_wettest_month", "precip_driest_month",
                     "precip_seas", "avg_monthly_precip_wettest_q", "avg_monthly_precip_driest_q",
-                    "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q", "total_photoperiod_window")
+                    "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q", "total_photoperiod_window") # chopped out "hopkins_delay_midpoint" maybe a bad idea?
     
     # Scale predictors using scale()
     phen_estimate_scaled <- phen_estimate
@@ -2148,9 +2148,9 @@ model_baseline_phenology_w_offset <- function(target_taxa,
         max_vif <- max(vif_results$VIF)
         passes_vif <- all(vif_results$VIF < vif_threshold)
         
-        if(!passes_vif){
-          cat("Excluding model with predictors:", paste(names(coef(best_model))[-1], collapse = ", "),
-              "- Max VIF =", round(max_vif, 2), "\n")
+        if(!passes_vif){ # lots of text like b4
+         # cat("Excluding model with predictors:", paste(names(coef(best_model))[-1], collapse = ", "),
+              #"- Max VIF =", round(max_vif, 2), "\n")
         }
       }
       
@@ -2385,7 +2385,17 @@ model_baseline_phenology_w_offset <- function(target_taxa,
   
   # Compute Duration
   phen_estimate <- phen_estimate %>% 
+    rename(predicted_onset = predicted) %>% 
     mutate(predicted_duration = predicted_offset - predicted_onset)
+  
+  # ensure that hopkins_delay_midpoint is available in the original raw data as well
+  phen_data <- phen_data %>% 
+    mutate(
+      # Extract numeric values from bin intervals
+      bin_lower = as.numeric(sub("\\((.+),.+\\]", "\\1", hopkins_bin)),
+      bin_upper = as.numeric(sub("\\(.+,(.+)\\]", "\\1", hopkins_bin)),
+      hopkins_delay_midpoint = (bin_lower + bin_upper) / 2
+    )
   
   
   
@@ -2416,10 +2426,10 @@ model_baseline_phenology_w_offset <- function(target_taxa,
     theme_minimal()
   # Env Space
   if(nrow(phen_estimate) > 3){
-    env_plot <- ggplot(phen_estimate, aes(x = onset, y = predicted)) +
+    env_plot <- ggplot(phen_estimate, aes(x = onset, y = predicted_onset)) +
       geom_point(alpha = 0.6) +
       geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
-      annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$predicted),
+      annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$predicted_onset),
                label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_val, rmse_val),
                hjust = 0, vjust = 1) +
       labs(x = "Observed Onset", y = "Predicted Onset", 
@@ -2441,9 +2451,11 @@ model_baseline_phenology_w_offset <- function(target_taxa,
     # return everything as list
     return(list(
       hopkins_model = hopkins_model, 
-      env_model = env_model, 
+      env_model_onset = env_model, 
+      env_model_offset = env_model_offset,
       data = phen_data,
       phen_est_data = phen_estimate, 
+      data_w_offset_vars = phen_data_with_windows,
       plots = list(hopkins = c(hop_plot1, hop_plot2), enviroment = c(env_plot, env_plot_offset)), 
       metrics = list(
         hopkins_r2 = r2_hop[[2]], 
@@ -2458,9 +2470,11 @@ model_baseline_phenology_w_offset <- function(target_taxa,
     # return everything as list
     return(list(
       hopkins_model = hopkins_model, 
-      env_model = NULL, 
+      env_model_onset = NULL, 
+      env_model_offset =NULL,
       data = phen_data,
       phen_est_data = phen_estimate, 
+      data_w_offset_vars = phen_data_with_windows,
       plots = list(hopkins = c(hop_plot1, hop_plot2), enviroment = NULL), 
       metrics = list(
         hopkins_r2 = r2_hop[[2]], 
@@ -2520,6 +2534,28 @@ predict_pheno_for_dist <- function(model_out,
   avg_monthly_precip_driest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio17_1981-2010_V.2.1.tif")
   avg_monthly_precip_warmest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio18_1981-2010_V.2.1.tif")
   avg_monthly_precip_coldest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio19_1981-2010_V.2.1.tif")
+  
+  # Monthly vals for termination cues
+  pet_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                               pattern = "CHELSA_pet_.*_1981-2010_V.2.1.tif$",
+                               full.names = TRUE))
+  tasmax_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                                  pattern = "CHELSA_tasmax_.*_1981-2010_V.2.1.tif$",
+                                  full.names = TRUE))
+  tasmin_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                                  pattern = "CHELSA_tasmin_.*_1981-2010_V.2.1.tif$",
+                                  full.names = TRUE))
+  tasmin_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                                  pattern = "CHELSA_tasmin_.*_1981-2010_V.2.1.tif$",
+                                  full.names = TRUE))
+  wind_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                                pattern = "CHELSA_sfcWind_.*_1981-2010_V.2.1.tif$",
+                                full.names = TRUE))
+  precip_stack <- rast(list.files("/orange/guralnick/Chelsa_climatologies/", 
+                                  pattern = "CHELSA_pr_.*_1981-2010_V.2.1.tif$",
+                                  full.names = TRUE))
+  
+  
   taxon_vect <- vect(taxon_df, 
                      geom = c("longitude", "latitude"),
                      crs = "EPSG:4326")
@@ -2544,13 +2580,33 @@ predict_pheno_for_dist <- function(model_out,
                             "precip_seas", "avg_monthly_precip_wettest_q", "avg_monthly_precip_driest_q",
                             "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q")
   
+  names(pet_stack) <- c("pet_01", "pet_02", "pet_03", "pet_04", "pet_05", "pet_06", 
+                        "pet_07", "pet_08", "pet_09", "pet_10", "pet_11", "pet_12")
+  names(tasmax_stack) <- c("tasmax_01", "tasmax_02", "tasmax_03", "tasmax_04", "tasmax_05", "tasmax_06", 
+                           "tasmax_07", "tasmax_08", "tasmax_09", "tasmax_10", "tasmax_11", "tasmax_12")
+  names(tasmin_stack) <- c("tasmin_01", "tasmin_02", "tasmin_03", "tasmin_04", "tasmin_05", "tasmin_06", 
+                           "tasmin_07", "tasmin_08", "tasmin_09", "tasmin_10", "tasmin_11", "tasmin_12")
+  names(wind_stack) <- c("sfcWind_01", "sfcWind_02", "sfcWind_03", "sfcWind_04", "sfcWind_05", "sfcWind_06", 
+                         "sfcWind_07", "sfcWind_08", "sfcWind_09", "sfcWind_10", "sfcWind_11", "sfcWind_12")
+  names(precip_stack) <- c("pr_01", "pr_02", "pr_03", "pr_04", "pr_05", "pr_06", 
+                           "pr_07", "pr_08", "pr_09", "pr_10", "pr_11", "pr_12")
   # Extract all raster values
   elevation_vals <- terra::extract(na_elev, taxon_vect_reproj1)
   climate_vals <- terra::extract(climate_stack, taxon_vect_reproj2)
+  pet_vals <- terra::extract(pet_stack, taxon_vect_reproj2)
+  tasmax_vals <- terra::extract(tasmax_stack, taxon_vect_reproj2)
+  tasmin_vals <- terra::extract(tasmin_stack, taxon_vect_reproj2)
+  wind_vals <- terra::extract(wind_stack, taxon_vect_reproj2)
+  precip_vals <- terra::extract(precip_stack, taxon_vect_reproj2)
   
   # Add all values to these data
   taxon_df[, elevation_m := elevation_vals[,2]]
   taxon_df[, names(climate_vals)[-1] := climate_vals[,-1]]
+  taxon_df[, names(pet_vals)[-1] := pet_vals[, -1]]
+  taxon_df[, names(tasmax_vals)[-1] :=tasmax_vals[, -1]]
+  taxon_df[, names(tasmin_vals)[-1] := tasmin_vals[, -1]]
+  taxon_df[, names(wind_vals)[-1] := wind_vals[, -1]]
+  taxon_df[, names(precip_vals)[-1] := precip_vals[, -1]]
   
   # Make hopkins bins a available predictor 
   ## Using this modified dataframe, recreate hopkins based on the anchor from the empirical data
@@ -2561,8 +2617,8 @@ predict_pheno_for_dist <- function(model_out,
   # these will be zero, we'll just adjust so we're going into negative space
   # create expected # of delay days based on hopkins
   taxon_df[, hopkins_delay_days :=
-             ((latitude - min_lat)* 4) + # latitudnal effect
-             ((elevation_m - min_elev))/120 * 4] # elevation effect
+             ((latitude - min_empirical_lat)* 4) + # latitudnal effect
+             ((elevation_m - min_empirical_elev))/120 * 4] # elevation effect
   
   # Create bins for phenology data based on Hopkins delay by intervals of 4
   taxon_df[, hopkins_bin := cut(hopkins_delay_days, 
@@ -2594,6 +2650,7 @@ predict_pheno_for_dist <- function(model_out,
     )
   # Some pixels lack elevation, which is why we get this warning. Probably try and see if we can fix this at a later time. 
   taxon_df <- taxon_df %>% filter(!is.na(hopkins_bin))
+  taxon_df <- taxon_df %>% filter(!is.na(hopkins_delay_midpoint)) # not entirely sure whats happening here. 
   
   ## Create Predictions 
   # apply hopkins linear model 
@@ -2601,39 +2658,266 @@ predict_pheno_for_dist <- function(model_out,
   taxon_df_predict <- predict(hopkins_linear, newdata = taxon_df)
   taxon_df[, hopkins_predict_onset := taxon_df_predict]
   # apply env glm 
-  env_model <- model_out$env_model
-  taxon_df_predict <- predict(env_model, newdata = taxon_df)
-  taxon_df[, env_predict_onset := taxon_df_predict]
-  # further restrict env predictions by CLAMP
-  predictor_vars <- attr(terms(env_model), "term.labels")
+  ## If its ensembled, we need to account for this and the weight of each model
+  predict_ensemble <- function(ensemble_model, newdata) {
+    
+    # scale the newdata using the scaling parameters
+    scaled_data <- newdata
+    for (var in names(ensemble_model$scaling_params)) {
+      if (var %in% names(newdata)) {
+        center <- ensemble_model$scaling_params[[var]]$center
+        scale <- ensemble_model$scaling_params[[var]]$scale
+        scaled_data[[var]] <- (newdata[[var]] - center) / scale
+      }
+    }
+    
+    # get predictions from each model
+    n_models <- length(ensemble_model$models)
+    predictions <- matrix(NA, nrow = nrow(newdata), ncol = n_models)
+    
+    for (i in 1:n_models) {
+      predictions[, i] <- predict(ensemble_model$models[[i]], 
+                                  newdata = scaled_data, 
+                                  type = "response")
+    }
+    
+    # weight the predictions
+    weighted_pred <- predictions %*% ensemble_model$weights
+    
+    return(as.vector(weighted_pred))
+  }
+  ## Bring in the onset & offset models 
+  env_model_onset <- model_out$env_model_onset
+  env_model_offset <- model_out$env_model_offset
+  
+  ## Predict Onset, if ensemble used then use predict_ensemble(), if not just use the single best model...
+  if(length(model_out$env_model_onset$models) > 0){
+    taxon_df_predict_onset <- predict_ensemble(env_model_onset, taxon_df)
+    taxon_df[, env_predict_onset := taxon_df_predict_onset]
+    cat("Ensemble Model Methods used to build onset prediction, applying this to full taxon range...")
+  } else {
+    taxon_df_predict_onset <- predict(env_model_onset, taxon_df)
+    taxon_df[, env_predict_onset := taxon_df_predict_onset]
+    cat("Single Best Model methods used to build onset prediction, applying this to full taxon range..,")
+  }
+  
+  ## Use Onset 'Anchor' to find window for potential offset termination cues 
+  ### Find the month onset was predicted to occur
+  taxon_df <- taxon_df %>% 
+    mutate(onset_month = lubridate::month(as.Date(env_predict_onset, origin = "1998-01-01")))
+  ### Create month winodw fxn 
+  get_month_window <- function(center_month) {
+    months <- c((center_month - 2) %% 12 + 1, 
+                (center_month - 1) %% 12 + 1,
+                center_month,
+                center_month %% 12 + 1,
+                (center_month + 1) %% 12 + 1)
+    unique(months[1:5])  # Get -2, 0, +2
+  }
+  ### Find averages for each window 
+  taxon_df <- taxon_df %>% 
+    rowwise() %>% 
+    mutate(
+      avg_pet_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pet_", sprintf("%02d", m))
+        mean(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      sd_pet_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pet_", sprintf("%02d", m))
+        sd(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      slope_pet_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pet_", sprintf("%02d", m))
+        vals <- as.numeric(cur_data()[cols])
+        if (all(is.na(vals))) NA_real_ else coef(lm(vals ~ seq_along(vals)))[2]
+      },
+      avg_tasmax_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmax_", sprintf("%02d", m))
+        mean(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      sd_tasmax_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmax_", sprintf("%02d", m))
+        sd(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      slope_tasmax_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmax_", sprintf("%02d", m))
+        vals <- as.numeric(cur_data()[cols])
+        if (all(is.na(vals))) NA_real_ else coef(lm(vals ~ seq_along(vals)))[2]
+      },
+      avg_tasmin_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmin_", sprintf("%02d", m))
+        mean(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      sd_tasmin_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmin_", sprintf("%02d", m))
+        sd(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      slope_tasmin_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("tasmin_", sprintf("%02d", m))
+        vals <- as.numeric(cur_data()[cols])
+        if (all(is.na(vals))) NA_real_ else coef(lm(vals ~ seq_along(vals)))[2]
+      },
+      avg_sfcWind_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("sfcWind_", sprintf("%02d", m))
+        mean(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      sd_sfcWind_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("sfcWind_", sprintf("%02d", m))
+        sd(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      slope_sfcWind_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("sfcWind_", sprintf("%02d", m))
+        vals <- as.numeric(cur_data()[cols])
+        if (all(is.na(vals))) NA_real_ else coef(lm(vals ~ seq_along(vals)))[2]
+      },
+      avg_pr_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pr_", sprintf("%02d", m))
+        mean(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      sd_pr_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pr_", sprintf("%02d", m))
+        sd(as.numeric(cur_data()[cols]), na.rm = TRUE)
+      },
+      slope_pr_window = {
+        m <- get_month_window(onset_month)
+        cols <- paste0("pr_", sprintf("%02d", m))
+        vals <- as.numeric(cur_data()[cols])
+        if (all(is.na(vals))) NA_real_ else coef(lm(vals ~ seq_along(vals)))[2]
+      } , 
+      total_photoperiod_window = {
+        m <- get_month_window(onset_month)
+        phi <- latitude * pi / 180
+        
+        total <- 0
+        for (month in m) {
+          days_in_month <- as.numeric(format(seq(as.Date(paste0("2023-", month, "-01")), 
+                                                 by = "month", length.out = 2)[2] - 1, "%d"))
+          for (day in 1:days_in_month) {
+            doy <- as.numeric(format(as.Date(paste0("2023-", month, "-", day)), "%j"))
+            delta <- 0.409 * sin(2 * pi * (doy - 81) / 365)
+            w <- acos(-tan(phi) * tan(delta))
+            daylength <- 24 * w / pi
+            total <- total + daylength
+          }
+        }
+        total
+      }
+    ) %>%
+    ungroup() 
+  taxon_df <- taxon_df %>% as.data.table()
+  
+  ## Now Predict Offset, if esembled use predict_ensemble, if not just use single best model
+  if(length(model_out$env_model_offset$models) > 0){
+  taxon_df_predict_offset <- predict_ensemble(env_model_offset, taxon_df)
+  taxon_df[, env_predict_offset := taxon_df_predict_offset]
+  cat("Ensemble Model Methods used to build offset prediction, applying this to full taxon range...")
+  } else {
+    taxon_df_predict_offset <- predict(env_model_offset, taxon_df)
+    taxon_df[, env_predict_offset := taxon_df_predict_offset]
+    cat("Single Best Model methods used to build offset prediction, applying this to full taxon range..,")
+  }
+  
+  ## Calculate Predicted Duration
+  taxon_df <- taxon_df %>% 
+    mutate(env_predict_duration = env_predict_offset - env_predict_onset)
+  
+  # Further use a CLAMP to restrict ourselves to Interpolation 
+  ## extract all unique predictor variables from the ensemble
+  if(length(model_out$env_model_onset$models) > 0){
+  predictor_vars_onset <- unique(unlist(lapply(env_model_onset$models, function(model) {
+    attr(terms(model), "term.labels")
+  })))
+  } else{
+    predictor_vars_onset <- attr(terms(env_model_onset), "term.labels")
+  }
+  if(length(model_out$env_model_offset$models) > 0){
+    predictor_vars_offset <- unique(unlist(lapply(env_model_offset$models, function(model) {
+      attr(terms(model), "term.labels")
+    })))
+  } else{
+    predictor_vars_offset <- attr(terms(env_model_offset), "term.labels")
+  }
   df <- model_out$data
-  training_vars <- df %>% 
+  df_offset <- model_out$data_w_offset_vars
+  training_vars_onset <- df %>% 
     ungroup() %>%
-    select(all_of(predictor_vars)) %>% 
+    select(all_of(predictor_vars_onset)) %>% 
+    distinct() %>% # remove redundancy
+    as.data.frame()
+  training_vars_offset <- df_offset %>% 
+    ungroup() %>%
+    select(all_of(predictor_vars_offset)) %>% 
     distinct() %>% # remove redundancy
     as.data.frame()
   
   # calc ranges (made flexible for different predictor_var combos)
-  train_ranges <- data.frame(
-    var = predictor_vars, 
-    min = sapply(predictor_vars, function(v) min(training_vars[[v]])), 
-    max = sapply(predictor_vars, function(v) max(training_vars[[v]]))
+  train_ranges_onset <- data.frame(
+    var = predictor_vars_onset, 
+    min = sapply(predictor_vars_onset, function(v) min(training_vars_onset[[v]])), 
+    max = sapply(predictor_vars_onset, function(v) max(training_vars_onset[[v]]))
   )
-  
+  train_ranges_offset <- data.frame(
+    var = predictor_vars_offset, 
+    min = sapply(predictor_vars_offset, function(v) min(training_vars_offset[[v]])), 
+    max = sapply(predictor_vars_offset, function(v) max(training_vars_offset[[v]]))
+  )
   # clamp!!
-  for(i in 1:nrow(train_ranges)){ # for each var
-    var_name <- train_ranges$var[i]
-    clamped_name <- paste0(var_name, "_clamped")
-    taxon_df[, (clamped_name) := pmax(train_ranges$min[i], 
-                                      pmin(train_ranges$max[i], get(var_name)))]
+  for(i in 1:nrow(train_ranges_onset)){ # for each var
+    var_name <- train_ranges_onset$var[i]
+    clamped_name <- paste0(var_name, "_onset_clamped")
+    taxon_df[, (clamped_name) := pmax(train_ranges_onset$min[i], 
+                                      pmin(train_ranges_onset$max[i], get(var_name)))]
+  }
+  for(i in 1:nrow(train_ranges_offset)){ # for each var
+    var_name <- train_ranges_offset$var[i]
+    clamped_name <- paste0(var_name, "_offset_clamped")
+    taxon_df[, (clamped_name) := pmax(train_ranges_offset$min[i], 
+                                      pmin(train_ranges_offset$max[i], get(var_name)))]
   }
   # create clamped prediction df
-  clamped_vars <- paste0(predictor_vars, "_clamped")
-  clamped_data <- taxon_df[, ..clamped_vars]
-  setnames(clamped_data, clamped_vars, predictor_vars)
+  clamped_vars_onset <- paste0(predictor_vars_onset, "_onset_clamped")
+  clamped_vars_offset <- paste0(predictor_vars_offset, "_offset_clamped")
+  
+  clamped_data_onset <- taxon_df[, ..clamped_vars_onset]
+  setnames(clamped_data_onset, clamped_vars_onset, predictor_vars_onset)
+  clamped_data_offset <- taxon_df[, ..clamped_vars_offset]
+  setnames(clamped_data_offset, clamped_vars_offset, predictor_vars_offset)
+  
   
   # make clamped predictions
-  taxon_df[, env_predict_onset_clamped := predict(env_model, newdata = clamped_data)]
+  if(length(model_out$env_model_onset$models) > 0){
+  taxon_df[, env_predict_onset_clamped := predict_ensemble(env_model_onset, newdata = clamped_data_onset)]
+    cat("Ensemble Model Methods used to build onset prediction, applying this with clamp to full taxon range...")
+  } else{
+    taxon_df[, env_predict_onset_clamped := predict(env_model_onset, newdata = clamped_data_onset)]
+    cat("Single Best Model Methods used to build onset prediction, applying this with clamp to full taxon range...")
+  }
+  
+  if(length(model_out$env_model_offset$models) > 0){
+    taxon_df[, env_predict_offset_clamped := predict_ensemble(env_model_offset, newdata = clamped_data_offset)]
+    cat("Ensemble Model Methods used to build offset prediction, applying this with clamp to full taxon range...")
+  } else{
+    taxon_df[, env_predict_offset_clamped := predict(env_model_offset, newdata = clamped_data_offset)]
+    cat("Single Best Model Methods used to build offset prediction, applying this with clamp to full taxon range...")
+  }
+  
+  # Calc Clamped Duration 
+  taxon_df <- taxon_df %>% 
+    mutate(env_predict_duration_clamped = env_predict_offset_clamped - env_predict_onset_clamped)
   
   # Create plots 
   ## get basemap (will need to edit to be more flexible l8ter)
@@ -2660,7 +2944,7 @@ predict_pheno_for_dist <- function(model_out,
       y = "Latitude", 
       title = paste("Training Data Distance on Hopkins Onset Predictions for", unique(df$species)))
   
-  env_pred_plot <- ggplot() +
+  env_pred_onset_plot <- ggplot() +
     geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_onset)) +
     geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
     scale_fill_viridis_c(name = "Climatic Onset Prediction", option = "plasma") +
@@ -2670,7 +2954,27 @@ predict_pheno_for_dist <- function(model_out,
       y = "Latitude", 
       title = paste("Climate GLM Onset Prediction Plot for", unique(df$species)))
   
-  clamped_env_pred_plot <- ggplot() +
+  env_pred_offset_plot <- ggplot() +
+    geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_offset)) +
+    geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
+    scale_fill_viridis_c(name = "Climatic Offset Prediction", option = "plasma") +
+    theme_bw() +
+    labs(
+      x = "Longitude", 
+      y = "Latitude", 
+      title = paste("Climate GLM Offset Prediction Plot for", unique(df$species)))
+  
+  env_pred_duration_plot <- ggplot() +
+    geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_duration)) +
+    geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
+    scale_fill_viridis_c(name = "Climatic Duration Prediction", option = "plasma") +
+    theme_bw() +
+    labs(
+      x = "Longitude", 
+      y = "Latitude", 
+      title = paste("Climate GLM Duration Prediction Plot for", unique(df$species)))
+  
+  clamped_env_pred_onset_plot <- ggplot() +
     geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_onset_clamped)) +
     geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
     scale_fill_viridis_c(name = "Clamped Climatic Onset Prediction", option = "plasma") +
@@ -2680,28 +2984,105 @@ predict_pheno_for_dist <- function(model_out,
       y = "Latitude", 
       title = paste("Clamped Climate GLM Onset Prediction Plot for", unique(df$species)))
   
+  clamped_env_pred_offset_plot <- ggplot() +
+    geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_offset_clamped)) +
+    geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
+    scale_fill_viridis_c(name = "Clamped Climatic Offset Prediction", option = "plasma") +
+    theme_bw() +
+    labs(
+      x = "Longitude", 
+      y = "Latitude", 
+      title = paste("Clamped Climate GLM Offset Prediction Plot for", unique(df$species)))
+  
+  min_val <- min(taxon_df$env_predict_duration_clamped, na.rm = TRUE)
+  max_val <- max(taxon_df$env_predict_duration_clamped, na.rm = TRUE)
+  zero_position <- (0 - min_val) / (max_val - min_val)
+  
+  clamped_env_pred_duration_plot <- ggplot() +
+    geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = env_predict_duration_clamped)) +
+    geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
+    scale_fill_gradientn(
+      colors = c("grey80", "grey80", viridis::plasma(100)),
+      values = c(0, zero_position - 0.0001, seq(zero_position, 1, length.out = 100)),
+      breaks = c(-100, 0, 50, 100, 150, 200),
+      labels = c("Unsuitable Duration \n Modeling", "0", "50", "100", "150", "200"),
+      name = "Clamped Climatic\nDuration Prediction"
+    ) +
+    theme_bw() +
+    labs(
+      x = "Longitude",
+      y = "Latitude",
+      title = paste("Clamped Climate GLM Duration Prediction Plot for", unique(df$species)))
+  
   ## Calculate MESS 
   if(env == TRUE){
+    ## ONSET MESS ##############################################################
     # crop rasters down to actual P area of taxon
     taxon_climate_proj <- project(taxon_rast_reproj, crs(temp_seas), method = "near") # use temp seas as a placeholder for all clims
-    climate_crop <- crop(climate_stack[[predictor_vars]], taxon_climate_proj)
-    taxon_climate_resamp <- resample(taxon_climate_proj, climate_crop[[1]], method = "near")
-    climate_masked <- mask(climate_crop, taxon_climate_resamp)
+    climate_onset_crop <- crop(climate_stack[[predictor_vars_onset]], taxon_climate_proj)
+    taxon_climate_onset_resamp <- resample(taxon_climate_proj, climate_onset_crop[[1]], method = "near")
+    climate_onset_masked <- mask(climate_onset_crop, taxon_climate_onset_resamp)
     # convert to old raster format for dismo::mess()
-    climate_stack_old <- raster::stack(climate_masked)
-    names(climate_stack_old) <- predictor_vars
+    climate_onset_stack_old <- raster::stack(climate_onset_masked)
+    names(climate_onset_stack_old) <- predictor_vars_onset
     # calc MESS
-    mess_raster_old <- dismo::mess(climate_stack_old, training_vars, full = FALSE)
+    onset_mess_raster_old <- dismo::mess(climate_onset_stack_old, training_vars_onset, full = FALSE)
     # convert to terra spatRaster
-    mess_raster <- rast(mess_raster_old)
+    onset_mess_raster <- rast(onset_mess_raster_old)
     # extract and append to df 
-    mess_vals <- terra::extract(mess_raster, 
+    onset_mess_vals <- terra::extract(onset_mess_raster, 
                                 taxon_df[, .(longitude, latitude)])
-    taxon_df[, mess := mess_vals[[2]]]
+    taxon_df[, onset_mess := onset_mess_vals[[2]]]
+    ############################################################################
     
+    ## OFFSET MESS #############################################################
+    taxon_climate_proj <- project(taxon_rast_reproj, crs(temp_seas), method = "near")
+    climate_stack_offset_intersection <- intersect(names(climate_stack), predictor_vars_offset)
+    offset_monthly_vars <- setdiff(predictor_vars_offset, names(climate_stack))
+    
+    # Get climate variables as rasters
+    climate_offset_crop <- crop(climate_stack[[climate_stack_offset_intersection]], taxon_climate_proj)
+    taxon_climate_offset_resamp <- resample(taxon_climate_proj, climate_offset_crop[[1]], method = "near")
+    climate_offset_masked <- mask(climate_offset_crop, taxon_climate_offset_resamp)
+    
+    # Create a data frame with coords and monthly vars, then convert to SpatVector
+    monthly_df <- taxon_df[, c("longitude", "latitude", offset_monthly_vars), with = FALSE]
+    coords_vect <- vect(monthly_df, geom = c("longitude", "latitude"), crs = "EPSG:4326")
+    
+    # Reproject to match climate rasters
+    coords_reproj <- project(coords_vect, crs(climate_offset_masked))
+    
+    # Rasterize monthly variables directly to match climate grid
+    monthly_raster_list <- lapply(offset_monthly_vars, function(var){
+      rast_var <- rasterize(coords_reproj, climate_offset_masked[[1]], field = var, fun = mean)
+      names(rast_var) <- var
+      return(rast_var)
+    })
+    
+    monthly_window_rast <- rast(monthly_raster_list)
+    
+    # Combine all variables in correct order
+    climate_offset_full <- c(climate_offset_masked, monthly_window_rast)
+    climate_offset_full <- climate_offset_full[[predictor_vars_offset]]  # Reorder to match
+    
+    # Convert to old raster format
+    climate_offset_stack_old <- raster::stack(climate_offset_full)
+    
+    # Get training data
+    training_vars_offset <- model_out$data_w_offset_vars %>%
+      select(all_of(predictor_vars_offset)) %>%
+      as.data.frame()
+    
+    # calc MESS
+    offset_mess_raster_old <- dismo::mess(climate_offset_stack_old, training_vars_offset, full = FALSE)
+    offset_mess_raster <- rast(offset_mess_raster_old)
+    offset_mess_vals <- terra::extract(offset_mess_raster, taxon_df[, .(longitude, latitude)])
+    taxon_df[, offset_mess := offset_mess_vals[[2]]]
+    
+    ############################################################################
     # plot
-    mess_plot <- ggplot() +
-      geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = mess)) +
+    mess_plot_onset <- ggplot() +
+      geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = onset_mess)) +
       geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
       scale_fill_viridis_c(name = "MESS eval", option = "plasma") +
       theme_minimal() +
@@ -2710,14 +3091,25 @@ predict_pheno_for_dist <- function(model_out,
         x = "Longitude", 
         y = "Latitude", 
         title = paste("MESS Map for Climate GLM Onset Prediction Plot for", unique(df$species)))
+    
+    mess_plot_offset <- ggplot() +
+      geom_tile(data = taxon_df, aes(x = longitude, y = latitude, fill = offset_mess)) +
+      geom_sf(basemap_reproj, mapping = aes(), fill = NA, color = "black") +
+      scale_fill_viridis_c(name = "MESS eval", option = "plasma") +
+      theme_minimal() +
+      theme_bw() +
+      labs(
+        x = "Longitude", 
+        y = "Latitude", 
+        title = paste("MESS Map for Climate GLM Offset Prediction Plot for", unique(df$species)))
   } else{
     mess_plot <- NULL
   }
   return(list(
     taxon_df = taxon_df,
     plots = list(
-      prediction = list(hop_pred_plot, env_pred_plot, clamped_env_pred_plot), 
-      quality = list(hop_training_dist_plot, mess_plot)
+      prediction = list(hop_pred_plot, env_pred_onset_plot, env_pred_offset_plot, clamped_env_pred_onset_plot, clamped_env_pred_offset_plot), 
+      quality = list(hop_training_dist_plot, mess_plot_onset, mess_plot_offset)
     )
   ))
   

@@ -5,6 +5,7 @@ library(terra)
 library(dplyr)
 library(ggplot2)
 source("/blue/guralnick/millerjared/PhenoInterpolate/code/draft/proxy-baseline-fxns.R")
+source("/blue/guralnick/millerjared/PhenoInterpolate/code/draft/scatch-fxn-building.R")
 
 bee_occs <- fread("/blue/soltis/millerjared/beeBDC/Bee-data/OutputData/05_cleaned_database.csv")
 # additional data on Anthophora hololeuca provided by Michael Orr
@@ -72,8 +73,8 @@ target_taxa <- na_taxonomy %>%
 
 taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
 #target_taxa <- "Anthophora hololeuca"
-model_out <- model_baseline_phenology(target_taxa, 
-                                      phenometric = 0.10, 
+model_out <- model_baseline_phenology_w_offset(target_taxa, 
+                                       
                                       bees_or_plants = "plants", # target taxon group to pull empirical data for
                                       phenovision_flowering_data, # input inat flowering annotations for flowering plants
                                       cch2_annotated_specimens,  # input specimen flowering annotations for flowering plants (CA)
@@ -84,10 +85,23 @@ model_out <- model_baseline_phenology(target_taxa,
 model_out$plots$hopkins
 model_out$plots$enviroment
 
+model_out <- model_baseline_phenophase_w_duration(target_taxa, 
+                                               
+                                               bees_or_plants = "plants", # target taxon group to pull empirical data for
+                                               phenovision_flowering_data, # input inat flowering annotations for flowering plants
+                                               cch2_annotated_specimens,  # input specimen flowering annotations for flowering plants (CA)
+                                               bee_occs, # input bee occurrence data
+                                               extra_hololeuca_data, # extra A. hololeuca occurrence data provided by M. Orr
+                                               min_doy = 38, # look at histogram when making this decision
+                                               max_doy = 244 )
+model_out$plots$hopkins
+model_out$plots$enviroment
+
+
 distribution_pred <- predict_pheno_for_dist(model_out, 
                                             path_to_target_taxon_PA_raster = "/blue/soltis/millerjared/Legume-Specialist-Occupancy/outputs/sdms/plants/Psorothamnus_polydenius_SDM_PA.tif", 
                                             hopkins = TRUE, 
-                                            env = FALSE)
+                                            env = TRUE)
 
 distribution_pred$plots$prediction
 distribution_pred$plots$quality

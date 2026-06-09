@@ -1,0 +1,1450 @@
+---
+title: "bee-plant-baseline-overlaps"
+author: "JT Miller"
+format: html
+toc: true
+theme: journal
+self-contained: true  
+editor: visual
+code-fold: true
+---
+
+# Bees & Peas, using macroecological modeling to compare distributions, phenology, and interaction space.
+
+### Background
+
+Global change is shifting species across axes of space & time (Fredston et al. 2025). With these shifts, species interactions and ecological structure of communities are likely to alter, modifying both the strength of these interactions and the biodiversity that shapes them. Forming hypotheses for potential interaction space and how they may vary across each taxon's range is important for establishing baselines to both model central biological tendencies of these ecological partners, as well as forming priorities for conservation of these ecologies. For plants and pollinators, three macroecological elements determine the interaction potential: spatial overlap, temporal overlap, and visitation likelihood. To construct hypotheses of potential interaction space over the bulk of a pollinator range, I combined spatial distribution modeling, interpolated phenology modeling, and interaction data sourced from GLOBI to evaluate how legume pollen emphasizing bees and host-plant taxa vary in overlaps over the each bees species range. 
+
+### Methods 
+
+Load Libraries 
+```{r}
+library(sf)
+library(terra)
+library(tidyverse)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+source("/blue/guralnick/millerjared/PhenoInterpolate/code/draft/proxy-baseline-fxns.R")
+```
+
+
+#### 1. Spatial Overlap
+We fitted enviromental niche models per taxa using best practices to construct each species distribution. We can then overlap these distributions with taxa of known interactions to construct a comparison of where interacting partners overlap. 
+```{r}
+# Bring In Species Distribution Models
+## CRS setup
+target_crs = "+proj=moll +lon_0=-87.38457 +datum=WGS84 +units=m +no_defs"
+
+## Load in Bee Species Distribution Model 
+a_holo_sdm <- terra::rast(paste0("/blue/soltis/millerjared/Legume-Specialist-Occupancy/outputs/sdms/bees/", "Anthophora_hololeuca", "_SDM_PA.tif"))
+a_holo_sdm <- terra::project(a_holo_sdm, target_crs, method = "near")
+
+## Load in Host-Plants Species Distribution Models
+## Plant models 
+plant_sp_old <- c("Psorothamnus arborescens","Psorothamnus emoryi","Psorothamnus fremontii", ## deal with some name changes.
+"Psorothamnus polydenius","Psorothamnus schottii","Psorothamnus spinosus")
+plant_sp_current <- c("Psorodendron arborescens","Psorothamnus emoryi", "Psorodendron fremontii",
+"Psorothamnus polydenius", "Psorodendron schottii", "Psorodendron spinosum")
+plant_PA_sdms <- list()
+  for(i in 1:length(plant_sp_old)){
+    if(file.exists(paste0("/blue/soltis/millerjared/Legume-Specialist-Occupancy/outputs/sdms/plants/", gsub(" ", "_", plant_sp_old[i]), "_SDM_PA.tif"))){
+      plant_PA_sdms[[i]] <- terra::rast(paste0("/blue/soltis/millerjared/Legume-Specialist-Occupancy/outputs/sdms/plants/", gsub(" ", "_", plant_sp_old[i]), "_SDM_PA.tif"))
+    }
+  }
+plant_PA_sdms <- lapply(plant_PA_sdms, function(r) {
+  terra::project(r, a_holo_sdm, method = "near")
+})
+names(plant_PA_sdms) <- plant_sp_current
+
+## stack plant rasters
+plant_sdm_stack <- terra::rast(plant_PA_sdms)
+
+# Overlap Taxa
+## mask plants to bee presences, only where bee == 1 and plant can be 0 or 1 
+plants_in_bee_range <- plant_sdm_stack * a_holo_sdm
+## calc plant sp richness across bee range
+plant_richness <- sum(plants_in_bee_range, na.rm = TRUE)
+## create P/A by cell for plant availability 
+plant_availability <- as.data.frame(plants_in_bee_range, xy = TRUE, na.rm = TRUE)
+
+## Create a richness df by pixel and visualize across bee's range
+richness_df <- as.data.frame(plant_richness, xy = TRUE)
+colnames(richness_df)[3] <- "richness"
+basemap <- rnaturalearth::ne_states(c("United States of America", "Mexico"), returnclass = "sf")
+basemap <- basemap %>% filter(name %in% c("California", "Nevada", "Arizona", "Sonora", "Baja California", "Baja California Sur"))
+basemap_reproj <- basemap %>% st_transform(st_crs(target_crs))
+  
+ggplot() +
+  geom_tile(data = richness_df, aes(x = x, y = y, fill = richness)) +
+  geom_sf(data = basemap_reproj, fill = NA, color = "black", linewidth = 0.5) +
+  scale_fill_viridis_c(name = "Host-Plant Species\nRichness") +
+  coord_sf(crs = st_crs(basemap_reproj)) +
+  theme_bw() +
+  labs(title = "Host-Plant Species Richness in Anthophora hololeuca's Range",
+       x = "Longitude", y = "Latitude")
+
+## Create a faceted figure to show which host-plants are where in the bee's range 
+plants_df <- as.data.frame(plants_in_bee_range, xy = TRUE) %>%
+  pivot_longer(cols = -c(x, y), names_to = "species", values_to = "presence") %>%
+  filter(!is.na(presence))
+
+ggplot() +
+  geom_tile(plants_df, mapping = aes(x = x, y = y, fill = factor(presence))) +
+  geom_sf(data = basemap, fill = NA, color = "black", linewidth = 0.5) +
+  facet_wrap(~species, ncol = 2) +
+  scale_fill_manual(values = c("0" = "grey80", "1" = "darkgreen"),
+                    name = "Presence") +
+  coord_sf(crs = st_crs(basemap_reproj)) +
+  theme_bw() +
+  labs(title = "Individual Plant Species Presence within Anthophora hololeuca's Range",
+       x = "Longitude", y = "Latitude")
+```
+
+We can take this a bit further and create cross-wise comparisons to see what host-plants are available per modeled pixel. 
+```{r}
+## first restrict to pixels where both the bee and plant co-occur
+bee_plant_overlap <- plant_sdm_stack * a_holo_sdm # where bee and plant == 1
+overlap_df <- as.data.frame(bee_plant_overlap, xy = TRUE)
+species_cols <- names(overlap_df)[-c(1,2)] # retrieve plant species names for comparison
+## Keep only rows where a plant has at least 1 occurrence
+keep_rows <- rowSums(overlap_df[, -c(1,2)] == 1, na.rm = TRUE) > 0
+filtered_df <- overlap_df[keep_rows, ]
+
+## calc n species per pixel 
+filtered_df$n_species <- rowSums(filtered_df[, -c(1,2)] == 1, na.rm = TRUE)
+
+## create combinations using apply 
+filtered_df$combination <- apply(filtered_df[, species_cols], 1, function(row) {
+  present <- species_cols[!is.na(row) & row == 1]
+  present_abbrev <- gsub("^Psorothamnus |^Psorodendron ", "P. ", present)
+  paste(present_abbrev, collapse = " & ")
+})
+
+## Select to simplify
+combination_df <- filtered_df[, c("x", "y", "combination", "n_species")]
+
+## Summarize
+combo_summary <- as.data.frame(table(combination_df$combination, combination_df$n_species))
+colnames(combo_summary) <- c("combination", "n_species", "count")
+combo_summary <- combo_summary[combo_summary$count > 0, ]
+combo_summary <- combo_summary[order(-combo_summary$count), ]
+
+# Create visuals 
+## get top combinations ordered by count
+top_combos <- combo_summary$combination[1:10]
+
+## get singles for areas where the bee only has access to a single host plant species
+singles <- combo_summary %>% filter(n_species == 1)
+
+## filter data
+combination_df_filtered <- combination_df[combination_df$combination %in% top_combos, ]
+combination_df_singles <- combination_df %>% filter(combination %in% singles$combination)
+
+## convert to factor with levels ordered by count (descending)
+combination_df_filtered$combination <- factor(
+  combination_df_filtered$combination,
+  levels = combo_summary$combination[combo_summary$combination %in% top_combos]
+)
+
+combination_df_singles$combination <- factor(
+  combination_df_singles$combination,
+  levels = singles$combination
+)
+
+## plot 
+ggplot() +
+  geom_tile(data = combination_df_filtered, aes(x = x, y = y, fill = combination)) +
+  geom_sf(data = basemap_reproj, fill = NA, color = "black", linewidth = 0.1, alpha = 0.2) +
+  scale_fill_brewer(palette = "Set3", name = "Plant Species\nCombination") +
+  coord_sf() +
+  theme_bw() +
+  labs(title = "Top 10 Most Common Host Plant Species Combinations for A. hololeuca Presence Overlap",
+       x = "Longitude", y = "Latitude")
+
+ggsave("/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/top-ten-host-combos-for-a-holo-range.png", height = 10, width = 10)
+
+
+ggplot() +
+  geom_tile(data = combination_df_singles, aes(x = x, y = y, fill = combination)) +
+  geom_sf(data = basemap_reproj, fill = NA, color = "black", linewidth = 0.1, alpha = 0.2) +
+  scale_fill_brewer(palette = "Set3", name = "Plant Species\nCombination") +
+  coord_sf() +
+  theme_bw() +
+  labs(title = "Regions where only a single host plant is present for A. hololeuca Presence Overlap",
+       x = "Longitude", y = "Latitude")
+
+ggsave("/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/single-host-for-a-holo-range.png", height = 10, width = 10)
+
+ggplot() +
+  geom_tile(combination_df, mapping = aes(x = x, y = y, fill = factor(n_species))) +
+  geom_sf(data = basemap_reproj, fill = NA, color = "black", linewidth = 0.1, alpha = 0.2) +
+  scale_fill_viridis_d(name = "Number of\nPlant Species") +
+  coord_sf() +
+  theme_bw() +
+  labs(title = "Host Plant Species Richness in A. hololeuca's Range",
+       x = "Longitude", y = "Latitude")
+
+ggsave("/blue/guralnick/millerjared/PhenoInterpolate/outputs/figures/host-plant-richness-for-a-holo-range.png", height = 10, width = 10)
+```
+
+#### 2. Phenology Overlaps
+Our goal here is to model predictions for onset and offset of flowering/insect flight per species across their range, so we may then compare pixel-by-pixel for potential overlaps. The challenge to this is that the empirical data that is available is opportunistic and messy. Here, I use Hopkins BioClimatic Law (Hopkins 1920) as a simple method for aggregating these data annually, constructing phenophase estimates using the package phenesse (Belitz et al. 2020), restructuring a latitude/elevation response based on empirical estimates, and finally using enviromental covariates to aid in the prediction of 'baseline' phenology trends across a taxon's range. <br>
+
+Andrew Hopkins, a self taught entomologist (that received a honorary Doctorate...crazy) formalized a Bioclimatic Law that had been used historically to guide safe dates to sow wheat in order to avoid the damage of a Hessian Fly in Germany. He chose to use plants to formalize the law, recrding flowering and intensity across a temperate eastern gradient. His law suggests that for a taxon, there is a uniform response of delaying flowering (or emergence) by 4 days for every degree in latitude or 400 ft (122m) elevation (Hopkins 1920). While called a 'Law', its more like 'guidelines' when it comes to universal application. Hopkins noted this, specifically referring to the Rocky Mountains Plataeu as an area where this Law breaks, for reasons he described as *other* controlling influences not being equal across geography. I was simply interested in whether our data even followed such a pattern, and was pleasantly surprised by the results. While 4 day delays are not what we recover in the west, we *do* see strong signal in there being a predictable delay across increments of 1 degree of latitude or 122m in elevation (or a equation to achieve whatever combination of these two). So much so that we can fit a simple linear model to these binned data and see a linear response in central tendencies. 
+```{r}
+## Load BeeBDC data and Extra A. hololeuca data provided by M. Orr
+bee_occs <- fread("/blue/soltis/millerjared/beeBDC/Bee-data/OutputData/05_cleaned_database.csv")
+extra_hololeuca_data <- fread("/blue/soltis/millerjared/SpatioTemporalTradeoffs/data/raw/a-hololeuca-from-Orr.csv")
+
+# Use a custom built function to grab target taxa's phenophase data (cleaned)
+target_taxa <- "Anthophora hololeuca"
+phen_data <- grab_bee_occs(target_taxa, bee_occs = bee_occs, extra_hololeuca_data = extra_hololeuca_data)
+phen_data[, row_id := .I] # create a row index to run joins
+# Add Elevation to Point Occurrence Data
+## TIF of elevation data for western NA
+na_elev <- rast("/blue/guralnick/millerjared/PhenoElevation/data/NAelevation4.tif")
+## convert occ data to a spatVect in WGS84
+phen_data_coords <- phen_data[!is.na(longitude) & !is.na(latitude)]
+phen_data_vect <- vect(phen_data_coords, 
+                         geom = c("longitude", "latitude"),
+                         crs = "EPSG:4326")
+## reproj to elevation raster projection
+phen_data_vect_reproj1 <- project(phen_data_vect, crs(na_elev))
+# Extract all raster values
+elevation_vals <- terra::extract(na_elev, phen_data_vect_reproj1)
+# append to coord data
+phen_data_coords[, elevation_m := elevation_vals[,2]]
+# merge with Orig datatable
+phen_data <- phen_data[phen_data_coords[, .(row_id, elevation_m)],
+                         on = "row_id"]
+## Remove NA elev
+phen_data <- phen_data %>% filter(!is.na(elevation_m))
+
+# Create Hopkins Expectation: For every degree in latitude or 122 meters of elevation, flowering will be delayed by 4 days. 
+  # use min vals as a baseline start
+  min_lat <- min(phen_data$latitude)
+  min_elev <- min(phen_data$elevation_m)
+  ## create expected # of delay days based on hopkins
+  phen_data[, hopkins_delay_days :=
+              ((latitude - min_lat)* 4) + # latitudnal effect
+              ((elevation_m - min_elev))/122 * 4] # elevation effect
+  
+  # Create bins for phenology data based on Hopkins delay by intervals of 4
+  phen_data[, hopkins_bin := cut(hopkins_delay_days, 
+                                 breaks = seq(0, max(hopkins_delay_days, na.rm = TRUE) + 4, by = 4), include.lowest = TRUE)]
+  
+# Before running phenometrics, its important to account for modality. This is best inspected visually, so I created a fxn that allows for assessments and to extract local minima in order to better limit where we make dayOfYear cutoff decisions
+described_phen_months <- fread("/blue/soltis/millerjared/Legume-Specialist-Occupancy/data/raw/hololeuca-and-host-pheno.csv")
+taxon_phen_hist(target_taxa, bees_or_plants = "bees", described_phen_months = described_phen_months)
+min_doy <- 21
+max_doy <- 234
+## Run Phenometric Cleaning 
+# remove outliers based on known flowering 
+phen_data <- phen_data %>%  filter(dayOfYear > min_doy & dayOfYear < max_doy)
+# downsample any dayOfYears that have abnormally high sampling on a dayOfYear within a year (City Nature Challenge and BioBlitzs)
+phen_data <- phen_data %>% 
+    group_by(species,year,hopkins_bin,dayOfYear) %>% 
+    dplyr::slice_sample(n = 3)
+# if sample is either a specimen (Herbarium data) or an occurrence (unspecified in bee data), then remove first day of the months from these data
+# these are possibly a data quality issue
+  phen_data <- phen_data %>% 
+    filter(!(source %in% c("occurrence", "specimen") & day == 1))
+
+   ## Create a phenesse estimate for phenometric 
+  phen_data_est_onset <- phen_data %>% 
+    group_by(species,hopkins_bin) %>% 
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>% 
+    group_modify(~ broom::tidy(phenesse::quantile_ci(observations = .x$dayOfYear, percentile = 0.10, bootstraps=1000)))
+  
+  phen_data_est_offset <- phen_data %>% 
+    group_by(species,hopkins_bin) %>% 
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>% 
+    group_modify(~ broom::tidy(phenesse::quantile_ci(observations = .x$dayOfYear, percentile = 0.90, bootstraps=1000)))
+  
+  # extract estimate
+  phen_onset_estimates <- phen_data_est_onset %>% 
+    filter(column == "estimate") %>% 
+    select(species, hopkins_bin, mean) %>% 
+    rename(onset_doy = mean) %>% ungroup()
+  
+  phen_offset_estimates <- phen_data_est_offset %>% 
+    filter(column == "estimate") %>% 
+    select(species, hopkins_bin, mean) %>% 
+    rename(offset_doy = mean) %>% ungroup() %>% select(-species)
+  
+  phen_estimates <- phen_onset_estimates %>% 
+    left_join(phen_offset_estimates, by = "hopkins_bin")
+
+# Remove any outliers 
+  phen_estimates <-  phen_estimates %>% 
+    group_by(species) %>% 
+    mutate(zonset = scale(onset_doy)) %>% 
+    filter(between(zonset,-3.25,+3.25))
+  
+  phen_estimates <-  phen_estimates %>% 
+    group_by(species) %>% 
+    mutate(zoffset = scale(offset_doy)) %>% 
+    filter(between(zoffset,-3.25,+3.25))
+  
+## Use Species Anchoring To Create a Predicted Hopkins Onset
+  # Use Rob's estimate sp anchors fxn
+  HOPKINS_LAT_SLOPE <- 4
+  HOPKINS_ELEV_SLOPE <- 4/122 
+  estimate_species_anchors <- function(df) {
+    df |> group_by(species) |>
+      group_modify(~{
+        x <- .x
+        slat <- median(x$lat_mean, na.rm = TRUE)
+        selev <- median(x$mid_elev, na.rm = TRUE)  
+        
+        if (nrow(x) >= 10 && length(unique(x$lat_mean[!is.na(x$lat_mean)])) > 2) {
+          m <- lm(onset ~ lat_mean, data = x)
+          sdoy <- as.numeric(predict(m, newdata = data.frame(lat_mean = slat)))
+        } else {
+          sdoy <- median(x$onset, na.rm = TRUE)
+        }
+        tibble(start_lat = slat, start_elev = selev, start_doy = sdoy) 
+      }) |>
+      ungroup()
+  }
+  
+  # bin summary (for creating hopkins predictions)
+  bin_summary <- phen_data %>%
+    group_by(species, hopkins_bin) %>%
+    summarise(
+      hopkins_lat = median(latitude, na.rm = TRUE),
+      hopkins_elev = median(elevation_m, na.rm = TRUE),
+      hopkins_delay = median(hopkins_delay_days, na.rm = TRUE),
+      n_obs = n(),
+      .groups = 'drop'
+    )
+  
+  # join bins 
+  phen_estimates <- phen_estimates %>% 
+    left_join(bin_summary, by = "hopkins_bin") %>% 
+    rename(lat_mean = hopkins_lat, 
+           mid_elev = hopkins_elev, 
+           onset = onset_doy, 
+           offset = offset_doy,
+           species = species.x) # redundant
+  
+  anchored_sp <- estimate_species_anchors(phen_estimates)
+  
+  
+  phen_estimate <- phen_estimates %>% 
+    left_join(anchored_sp, by = 'species')
+  
+  # extract midpoint of each hopkins bin to use as predictor
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      # Extract numeric values from bin intervals
+      bin_lower = as.numeric(sub("\\((.+),.+\\]", "\\1", hopkins_bin)),
+      bin_upper = as.numeric(sub("\\(.+,(.+)\\]", "\\1", hopkins_bin)),
+      hopkins_delay_midpoint = (bin_lower + bin_upper) / 2
+    )
+  
+  ## Run a Hopkins model based on bins
+  hopkins_model <- lm(onset ~ hopkins_delay_midpoint, data = phen_estimate)
+  r2_hop <- performance::r2(hopkins_model)
+  res_hop <- residuals(hopkins_model)
+  rmse_val_hop <- sqrt(mean(res_hop^2))
+  # Extract the corrected slope (actual delay rate per Hopkins bin unit)
+  actual_delay_rate <- coef(hopkins_model)[2]
+  actual_delay_se <- summary(hopkins_model)$coefficients[2, 2]
+  # Apply the corrected slope with uncertainty bounds
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      #cCalculate delay from the anchor point using Hopkins bins
+      delay_from_anchor = hopkins_delay_midpoint - 
+        ((start_lat - min_lat) * 4 + 
+           (start_elev - min_elev) / 122 * 4),
+      
+      # apply actual observed delay rate
+      corrected_onset_prediction = start_doy + (delay_from_anchor * actual_delay_rate),
+      
+      # Add uncertainty bounds based on SE of slope
+      corrected_onset_lower = start_doy + (delay_from_anchor * (actual_delay_rate - actual_delay_se)),
+      corrected_onset_upper = start_doy + (delay_from_anchor * (actual_delay_rate + actual_delay_se))
+    )
+
+## Visualize 
+hop_plot1 <- ggplot(phen_estimate, aes(x = hopkins_delay_midpoint, y = onset)) +
+    geom_point(size = 3) +
+    geom_smooth(method = "lm", se = TRUE) +
+    annotate("text", x = min(phen_estimate$hopkins_delay_midpoint), y = max(phen_estimate$onset),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days\nActual Delay Rate = %.3f days", r2_hop[[2]], rmse_val_hop, actual_delay_rate),
+             hjust = 0, vjust = 1) +
+    labs(x = "Hopkins Expected Delay Bin (Middle Value for Bin)",
+         y = "Observed Onset (day of year)",
+         title = paste("Testing Hopkins Bioclimatic Law on", target_taxa[1])) +
+    theme_minimal()
+
+hop_plot2 <- ggplot(phen_estimate, aes(x = corrected_onset_prediction, y = onset)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    #geom_ribbon(aes(ymin = corrected_onset_lower, ymax = corrected_onset_upper), 
+    #alpha = 0.2, fill = "blue") +
+    geom_point(size = 3) +
+    annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$corrected_onset_prediction),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_hop[[2]], rmse_val_hop),
+             hjust = 0, vjust = 1) +
+    labs(x = "Corrected Predicted Onset (anchored + actual slope)",
+         y = "Empirical Estimate Onset (day of year)",
+         title = paste("Hopkins Estimate Error Plot", target_taxa[1])) +
+    theme_minimal()
+
+hop_plot1 + hop_plot2
+  
+```
+As we can see, Hopkins Bins actually end up showing us a very convinient way to stratify the aggregation units for making phenometric estimates on the unstructured data. It is little suprise there is some utility to this (as latitude and elevation both modify the enviroment an organism experiences, principally by temperature), but to see such a strong signal particularly in a western desert taxa was not something I really expected. Whats really cool about this I think is that this relationship is strong enough that we can say something about the delay rate. According to these empirical estimates, A. hololeuca will have a delayed emergence of 1 day for every degree of latitude or 122 meters in elevation (or whatever combination of those leads to the bins). One important point to emphasize here however is this should be interpreted as the central tendency/baseline of the species. Average enviromental conditions across this latitudnal/elevational gradient are what likely contribute to the predictable pattern we're observing, therefore deviations away from that average (either microhabitat variation and/or intrannual variations) will cause deviations.  <br>
+
+We can try this for the host-plants by wrapping this code up into a function
+```{r}
+phenovision_flowering_data <- fread("/blue/guralnick/millerjared/phenovision_data/phenovision_flowers_03_15_2026.csv")
+cch2_annotated_specimens <- fread("/blue/soltis/millerjared/SpatioTemporalTradeoffs/data/processed/cch2-data/cch2-cleaned-and-aligned-data.csv")
+
+check_hopkins_relationship <- function(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy, max_doy){
+  phen_data <- grab_flowering_occs(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens)
+  phen_data[, row_id := .I] # create a row index to run joins
+# Add Elevation to Point Occurrence Data
+## TIF of elevation data for western NA
+na_elev <- rast("/blue/guralnick/millerjared/PhenoElevation/data/NAelevation4.tif")
+## convert occ data to a spatVect in WGS84
+phen_data_coords <- phen_data[!is.na(longitude) & !is.na(latitude)]
+phen_data_vect <- vect(phen_data_coords, 
+                         geom = c("longitude", "latitude"),
+                         crs = "EPSG:4326")
+## reproj to elevation raster projection
+phen_data_vect_reproj1 <- project(phen_data_vect, crs(na_elev))
+# Extract all raster values
+elevation_vals <- terra::extract(na_elev, phen_data_vect_reproj1)
+# append to coord data
+phen_data_coords[, elevation_m := elevation_vals[,2]]
+# merge with Orig datatable
+phen_data <- phen_data[phen_data_coords[, .(row_id, elevation_m)],
+                         on = "row_id"]
+## Remove NA elev
+phen_data <- phen_data %>% filter(!is.na(elevation_m))
+
+# Create Hopkins Expectation: For every degree in latitude or 122 meters of elevation, flowering will be delayed by 4 days. 
+  # use min vals as a baseline start
+  min_lat <- min(phen_data$latitude)
+  min_elev <- min(phen_data$elevation_m)
+  ## create expected # of delay days based on hopkins
+  phen_data[, hopkins_delay_days :=
+              ((latitude - min_lat)* 4) + # latitudnal effect
+              ((elevation_m - min_elev))/122 * 4] # elevation effect
+  
+  # Create bins for phenology data based on Hopkins delay by intervals of 4
+  phen_data[, hopkins_bin := cut(hopkins_delay_days, 
+                                 breaks = seq(0, max(hopkins_delay_days, na.rm = TRUE) + 4, by = 4), include.lowest = TRUE)]
+  
+## Run Phenometric Cleaning 
+# remove outliers based on known flowering 
+phen_data <- phen_data %>%  filter(dayOfYear > min_doy & dayOfYear < max_doy)
+# downsample any dayOfYears that have abnormally high sampling on a dayOfYear within a year (City Nature Challenge and BioBlitzs)
+phen_data <- phen_data %>% 
+    group_by(species,year,hopkins_bin,dayOfYear) %>% 
+    dplyr::slice_sample(n = 3)
+# if sample is either a specimen (Herbarium data) or an occurrence (unspecified in bee data), then remove first day of the months from these data
+# these are possibly a data quality issue
+  phen_data <- phen_data %>% 
+    filter(!(source %in% c("occurrence", "specimen") & day == 1))
+
+   ## Create a phenesse estimate for phenometric 
+  phen_data_est_onset <- phen_data %>% 
+    group_by(species,hopkins_bin) %>% 
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>% 
+    group_modify(~ broom::tidy(phenesse::quantile_ci(observations = .x$dayOfYear, percentile = 0.10, bootstraps=1000)))
+  
+  phen_data_est_offset <- phen_data %>% 
+    group_by(species,hopkins_bin) %>% 
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>% 
+    group_modify(~ broom::tidy(phenesse::quantile_ci(observations = .x$dayOfYear, percentile = 0.90, bootstraps=1000)))
+  
+  # extract estimate
+  phen_onset_estimates <- phen_data_est_onset %>% 
+    filter(column == "estimate") %>% 
+    select(species, hopkins_bin, mean) %>% 
+    rename(onset_doy = mean) %>% ungroup()
+  
+  phen_offset_estimates <- phen_data_est_offset %>% 
+    filter(column == "estimate") %>% 
+    select(species, hopkins_bin, mean) %>% 
+    rename(offset_doy = mean) %>% ungroup() %>% select(-species)
+  
+  phen_estimates <- phen_onset_estimates %>% 
+    left_join(phen_offset_estimates, by = "hopkins_bin")
+
+# Remove any outliers 
+  phen_estimates <-  phen_estimates %>% 
+    group_by(species) %>% 
+    mutate(zonset = scale(onset_doy)) %>% 
+    filter(between(zonset,-3.25,+3.25))
+  
+  phen_estimates <-  phen_estimates %>% 
+    group_by(species) %>% 
+    mutate(zoffset = scale(offset_doy)) %>% 
+    filter(between(zoffset,-3.25,+3.25))
+  
+## Use Species Anchoring To Create a Predicted Hopkins Onset
+  # Use Rob's estimate sp anchors fxn
+  HOPKINS_LAT_SLOPE <- 4
+  HOPKINS_ELEV_SLOPE <- 4/122 
+  estimate_species_anchors <- function(df) {
+    df |> group_by(species) |>
+      group_modify(~{
+        x <- .x
+        slat <- median(x$lat_mean, na.rm = TRUE)
+        selev <- median(x$mid_elev, na.rm = TRUE)  
+        
+        if (nrow(x) >= 10 && length(unique(x$lat_mean[!is.na(x$lat_mean)])) > 2) {
+          m <- lm(onset ~ lat_mean, data = x)
+          sdoy <- as.numeric(predict(m, newdata = data.frame(lat_mean = slat)))
+        } else {
+          sdoy <- median(x$onset, na.rm = TRUE)
+        }
+        tibble(start_lat = slat, start_elev = selev, start_doy = sdoy) 
+      }) |>
+      ungroup()
+  }
+  
+  # bin summary (for creating hopkins predictions)
+  bin_summary <- phen_data %>%
+    group_by(species, hopkins_bin) %>%
+    summarise(
+      hopkins_lat = median(latitude, na.rm = TRUE),
+      hopkins_elev = median(elevation_m, na.rm = TRUE),
+      hopkins_delay = median(hopkins_delay_days, na.rm = TRUE),
+      n_obs = n(),
+      .groups = 'drop'
+    )
+  
+  # join bins 
+  phen_estimates <- phen_estimates %>% 
+    left_join(bin_summary, by = "hopkins_bin") %>% 
+    rename(lat_mean = hopkins_lat, 
+           mid_elev = hopkins_elev, 
+           onset = onset_doy, 
+           offset = offset_doy,
+           species = species.x) # redundant
+  
+  anchored_sp <- estimate_species_anchors(phen_estimates)
+  
+  
+  phen_estimate <- phen_estimates %>% 
+    left_join(anchored_sp, by = 'species')
+  
+  # extract midpoint of each hopkins bin to use as predictor
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      # Extract numeric values from bin intervals
+      bin_lower = as.numeric(sub("\\((.+),.+\\]", "\\1", hopkins_bin)),
+      bin_upper = as.numeric(sub("\\(.+,(.+)\\]", "\\1", hopkins_bin)),
+      hopkins_delay_midpoint = (bin_lower + bin_upper) / 2
+    )
+  
+  ## Run a Hopkins model based on bins
+  hopkins_model <- lm(onset ~ hopkins_delay_midpoint, data = phen_estimate)
+  r2_hop <- performance::r2(hopkins_model)
+  res_hop <- residuals(hopkins_model)
+  rmse_val_hop <- sqrt(mean(res_hop^2))
+  # Extract the corrected slope (actual delay rate per Hopkins bin unit)
+  actual_delay_rate <- coef(hopkins_model)[2]
+  actual_delay_se <- summary(hopkins_model)$coefficients[2, 2]
+  # Apply the corrected slope with uncertainty bounds
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      #cCalculate delay from the anchor point using Hopkins bins
+      delay_from_anchor = hopkins_delay_midpoint - 
+        ((start_lat - min_lat) * 4 + 
+           (start_elev - min_elev) / 122 * 4),
+      
+      # apply actual observed delay rate
+      corrected_onset_prediction = start_doy + (delay_from_anchor * actual_delay_rate),
+      
+      # Add uncertainty bounds based on SE of slope
+      corrected_onset_lower = start_doy + (delay_from_anchor * (actual_delay_rate - actual_delay_se)),
+      corrected_onset_upper = start_doy + (delay_from_anchor * (actual_delay_rate + actual_delay_se))
+    )
+
+## Visualize 
+hop_plot1 <- ggplot(phen_estimate, aes(x = hopkins_delay_midpoint, y = onset)) +
+    geom_point(size = 3) +
+    geom_smooth(method = "lm", se = TRUE) +
+    annotate("text", x = min(phen_estimate$hopkins_delay_midpoint), y = max(phen_estimate$onset),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days\nActual Delay Rate = %.3f days", r2_hop[[2]], rmse_val_hop, actual_delay_rate),
+             hjust = 0, vjust = 1) +
+    labs(x = "Hopkins Expected Delay Bin (Middle Value for Bin)",
+         y = "Observed Onset (day of year)",
+         title = paste("Testing Hopkins Bioclimatic Law on", target_taxa[1])) +
+    theme_minimal()
+
+hop_plot2 <- ggplot(phen_estimate, aes(x = corrected_onset_prediction, y = onset)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    #geom_ribbon(aes(ymin = corrected_onset_lower, ymax = corrected_onset_upper), 
+    #alpha = 0.2, fill = "blue") +
+    geom_point(size = 3) +
+    annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$corrected_onset_prediction),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_hop[[2]], rmse_val_hop),
+             hjust = 0, vjust = 1) +
+    labs(x = "Corrected Predicted Onset (anchored + actual slope)",
+         y = "Empirical Estimate Onset (day of year)",
+         title = paste("Hopkins Estimate Error Plot", target_taxa[1])) +
+    theme_minimal()
+
+return(hop_plot1 + hop_plot2)
+}
+
+## Load in North American Taxonomy
+na_taxonomy <- fread("/blue/guralnick/millerjared/PlantSweepeR/data/processed/wcvp-ncbi-alignment-na.csv")
+
+
+### For each plant taxa, run this fxn 
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorodendron arborescens") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 30, max_doy = 228)
+
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorothamnus polydenius") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 38, max_doy = 244)
+
+
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorodendron fremontii") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 19, max_doy = 238)
+
+
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorothamnus emoryi") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 12, max_doy = 185)
+
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorodendron schottii") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 15, max_doy = 215)
+
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Psorodendron spinosum") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 86, max_doy = 248)
+
+## Annual Taxa 
+target_taxa <- na_taxonomy %>% 
+  filter(alignedParentName == "Rafinesquia neomexicana") %>% 
+  arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+  pull(name)
+
+taxon_phen_hist(target_taxa, bees_or_plants = "plants", described_phen_months = described_phen_months)
+
+check_hopkins_relationship(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens, min_doy = 0, max_doy = 217)
+
+
+
+```
+
+To me, these results are pretty good. We can see at least some relationship in most of the species with Hopkins BioClimatic Law. It works just as well for a annual plant (Rafinesquia neomexicana) as it does for perennials. <br> 
+
+Lets take it a step further though, we're going to keep the binning to hopkins logic, but rather than using the estimated delay by bin as a predictor, we're going to use summaries of the average climatic conditions for the phenophase observed per bin to fit a generalized linear model. Per flowering/bee occurrence, I extracted bioclimatic variables underlying that spatial point. For each hopkins delay bin, we then take the average of these occurrence's enviromental conditions. To model phenological onset as a function of climate, I then used an ensemble modeling framework with multicollinearity constraints and coefficient stability checks. For a pool of 19 annual bioclimatic variables (Chelsea v2.1) I generated all 3-predictor combinations (969 combos). All predictors were standardized with a z-score prior to modeling so that we could compare coefficient estimates across model fits. <br>
+
+For each 3-predictor combination, we fit a generalized linear model with phenological onset as the response variable. I used performance::check_collinearity() to evaluate variance inflation factors (VIF) and only retained models with a VIF <= 5 for all predictors. From the valid models, I ran model selection, and retained the top 10 models (AIC < 2) if applicable (as these models are competitive for explanatory power), or otherwise just the top model (if AIC > 2 for any singular model). <br>
+
+If multiple models were identified (AIC < 2), I assessed coefficient stability across the ensemble candidates. For each predictor appearing in the candidate models, we calculated the coefficient of variation (CV) and relative interquantile range (IQR) across models. If any predictor had high variability (CV > 50% or IQR > 0.5), this indcated that the predictors effects were unstable across models, and therefore I chose to abandom ensemble methods and instead selected the single best model based on AIC. If coefficient stability was found, I proceeded with ensembling based on normalized AIC weights. 
+
+
+```{r}
+model_baseline_onset_w_clim <- function(target_taxa,
+                                     bees_or_plants = "plants", # target taxon group to pull empirical data for
+                                     phenovision_flowering_data, # input inat flowering annotations for flowering plants
+                                     cch2_annotated_specimens,  # input specimen flowering annotations for flowering plants (CA)
+                                     bee_occs, # input bee occurrence data
+                                     extra_hololeuca_data, # extra A. hololeuca occurrence data provided by M. Orr
+                                     min_doy = 0, # look at histogram when making this decision
+                                     max_doy = 365 # ditto to above
+){
+  
+  ## Get Phenology Data
+  if(bees_or_plants == "plants"){
+    phen_data <- grab_flowering_occs(target_taxa, phenovision_flowering_data = phenovision_flowering_data, cch2_annotated_specimens = cch2_annotated_specimens)
+  }
+  if(bees_or_plants == "bees"){
+    phen_data <- grab_bee_occs(target_taxa, bee_occs = bee_occs, extra_hololeuca_data = extra_hololeuca_data)
+  }
+  
+  ## Attach Elevation & Climatic Variable Data
+  # add a row ID to track where we're combing vars with occs
+  phen_data[, row_id := .I]
+  phen_data_coords <- phen_data[!is.na(longitude) & !is.na(latitude)]
+  # load North America Elev Raster & Chelsa annual clim vars
+  na_elev <- rast("/blue/guralnick/millerjared/PhenoElevation/data/NAelevation4.tif")
+  avg_temp <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio1_1981-2010_V.2.1.tif")
+  avg_diurnal_temp_range <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio02_1981-2010_V.2.1.tif")
+  isothermality <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio03_1981-2010_V.2.1.tif")
+  temp_seas <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio4_1981-2010_V.2.1.tif")
+  tmax <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio5_1981-2010_V.2.1.tif")
+  tmin <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio6_1981-2010_V.2.1.tif")
+  annual_temp_range <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio07_1981-2010_V.2.1.tif")
+  avg_monthly_temp_wettest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio08_1981-2010_V.2.1.tif")
+  avg_monthly_temp_driest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio09_1981-2010_V.2.1.tif")
+  avg_monthly_temp_warmest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio10_1981-2010_V.2.1.tif")
+  avg_monthly_temp_coldest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio11_1981-2010_V.2.1.tif")
+  annual_precip <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio12_1981-2010_V.2.1.tif")
+  precip_wettest_month <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio13_1981-2010_V.2.1.tif")
+  precip_driest_month <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio14_1981-2010_V.2.1.tif")
+  precip_seas <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio15_1981-2010_V.2.1.tif")
+  avg_monthly_precip_wettest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio16_1981-2010_V.2.1.tif")
+  avg_monthly_precip_driest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio17_1981-2010_V.2.1.tif")
+  avg_monthly_precip_warmest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio18_1981-2010_V.2.1.tif")
+  avg_monthly_precip_coldest_q <- rast("/blue/guralnick/share/Chelsa-climate-data/climatologies/CHELSA_bio19_1981-2010_V.2.1.tif")
+  
+  # convert occ data to a spatVect in WGS84
+  phen_data_vect <- vect(phen_data_coords, 
+                         geom = c("longitude", "latitude"),
+                         crs = "EPSG:4326")
+  # reproj to elevation raster projection & clim raster projections
+  phen_data_vect_reproj1 <- project(phen_data_vect, crs(na_elev))
+  phen_data_vect_reproj2 <- project(phen_data_vect, crs(avg_temp)) 
+  # Stack all climate layers
+  climate_stack <- c(avg_temp, avg_diurnal_temp_range, isothermality,
+                     temp_seas, tmax, tmin, annual_temp_range,
+                     avg_monthly_temp_wettest_q, avg_monthly_temp_driest_q,
+                     avg_monthly_temp_warmest_q, avg_monthly_temp_coldest_q,
+                     annual_precip, precip_wettest_month, precip_driest_month,
+                     precip_seas, avg_monthly_precip_wettest_q, avg_monthly_precip_driest_q,
+                     avg_monthly_precip_warmest_q, avg_monthly_precip_coldest_q)
+  
+  # make names clearer
+  names(climate_stack) <- c("avg_temp", "avg_diurnal_temp_range", "isothermality",
+                            "temp_seas", "tmax", "tmin", "annual_temp_range",
+                            "avg_monthly_temp_wettest_q", "avg_monthly_temp_driest_q",
+                            "avg_monthly_temp_warmest_q", "avg_monthly_temp_coldest_q",
+                            "annual_precip", "precip_wettest_month", "precip_driest_month",
+                            "precip_seas", "avg_monthly_precip_wettest_q", "avg_monthly_precip_driest_q",
+                            "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q")
+  
+
+  # Extract all raster values
+  elevation_vals <- terra::extract(na_elev, phen_data_vect_reproj1)
+  climate_vals <- terra::extract(climate_stack, phen_data_vect_reproj2)
+  
+  # Add all values to these data
+  phen_data_coords[, elevation_m := elevation_vals[,2]]
+  phen_data_coords[, names(climate_vals)[-1] := climate_vals[,-1]]
+
+  # add elevation values to occ table using row_id as our key
+  phen_data_coords[, elevation_m := elevation_vals[,2]]
+  # merge
+  phen_data <- phen_data[phen_data_coords[, .(row_id, elevation_m, avg_temp, avg_diurnal_temp_range, isothermality,
+                                              temp_seas, tmax, tmin, annual_temp_range,
+                                              avg_monthly_temp_wettest_q, avg_monthly_temp_driest_q,
+                                              avg_monthly_temp_warmest_q, avg_monthly_temp_coldest_q,
+                                              annual_precip, precip_wettest_month, precip_driest_month,
+                                              precip_seas, avg_monthly_precip_wettest_q, avg_monthly_precip_driest_q,
+                                              avg_monthly_precip_warmest_q, avg_monthly_precip_coldest_q)],
+                         on = "row_id"]
+  # remove NA elevation vals
+  phen_data <- phen_data[!is.na(elevation_m) & !is.na(avg_temp) & !is.na(avg_diurnal_temp_range) & !is.na(isothermality) & !is.na(temp_seas) 
+                         & !is.na(tmax) & !is.na(tmin) & !is.na(annual_temp_range) & !is.na(avg_monthly_temp_wettest_q) & !is.na(avg_monthly_temp_driest_q) &
+                           !is.na(avg_monthly_temp_warmest_q) & !is.na(avg_monthly_temp_coldest_q) & !is.na(annual_precip) &
+                           !is.na(precip_wettest_month) & !is.na(precip_driest_month) & !is.na(precip_seas) & !is.na(avg_monthly_precip_wettest_q) &
+                           !is.na(avg_monthly_precip_driest_q) & !is.na(avg_monthly_precip_warmest_q) & !is.na(avg_monthly_precip_coldest_q),]
+  
+  ## Create Hopkins Expectation: For every degree in latitude or 120 meters of elevation, flowering will be delayed by 4 days. 
+  # use min vals as a baseline start
+  min_lat <- min(phen_data$latitude)
+  min_elev <- min(phen_data$elevation_m)
+  ## create expected # of delay days based on hopkins
+  phen_data[, hopkins_delay_days :=
+              ((latitude - min_lat)* 4) + # latitudnal effect
+              ((elevation_m - min_elev))/122 * 4] # elevation effect
+  
+  # Create bins for phenology data based on Hopkins delay by intervals of 4
+  phen_data[, hopkins_bin := cut(hopkins_delay_days, 
+                                 breaks = seq(0, max(hopkins_delay_days, na.rm = TRUE) + 4, by = 4), include.lowest = TRUE)]
+  
+  ## Run Phenometric Cleaning 
+  # remove outliers based on known flowering 
+  phen_data <- phen_data %>%  filter(dayOfYear > min_doy & dayOfYear < max_doy)
+  # downsample any dayOfYears that have abnormally high sampling on a dayOfYear within a year (City Nature Challenge and BioBlitzs)
+  phen_data <- phen_data %>% 
+    group_by(species,year,hopkins_bin,dayOfYear) %>% 
+    dplyr::slice_sample(n = 3)
+  # if sample is either a specimen (Herbarium data) or an occurrence (unspecified in bee data), then remove first day of the months from these data
+  # these are possibly a data quality issue
+  phen_data <- phen_data %>% 
+    filter(!(source %in% c("occurrence", "specimen") & day == 1))
+  
+  
+  ## Create a phenesse estimate for phenometric 
+  phen_data_est_onset <- phen_data %>% 
+    group_by(species,hopkins_bin) %>% 
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>% 
+    group_modify(~ broom::tidy(phenesse::quantile_ci(observations = .x$dayOfYear, percentile = 0.10, bootstraps=1000)))
+  
+  
+  # extract estimate
+  phen_onset_estimates <- phen_data_est_onset %>% 
+    filter(column == "estimate") %>% 
+    select(species, hopkins_bin, mean) %>% 
+    rename(onset_doy = mean) %>% ungroup()
+  
+  phen_estimates <- phen_onset_estimates 
+  
+
+  
+  ## Attach env avg summaries per hopkins bin
+  hopkins_bin_env_summaries <- phen_data %>%
+    group_by(species, hopkins_bin) %>%
+    filter(n() >= 7) %>%
+    filter(n_distinct(dayOfYear) > 3) %>%
+    summarize(avg_temp = mean(avg_temp),
+              avg_diurnal_temp_range = mean(avg_diurnal_temp_range),
+              isothermality = mean(isothermality),
+              temp_seas = mean(temp_seas),
+              tmax = mean(tmax),
+              tmin = mean(tmin),
+              annual_temp_range = mean(annual_temp_range),
+              avg_monthly_temp_wettest_q = mean(avg_monthly_temp_wettest_q),
+              avg_monthly_temp_driest_q = mean(avg_monthly_temp_driest_q),
+              avg_monthly_temp_warmest_q = mean(avg_monthly_temp_warmest_q),
+              avg_monthly_temp_coldest_q = mean(avg_monthly_temp_coldest_q),
+              annual_precip = mean(annual_precip),
+              precip_wettest_month = mean(precip_wettest_month),
+              precip_driest_month = mean(precip_driest_month),
+              precip_seas = mean(precip_seas),
+              avg_monthly_precip_wettest_q = mean(avg_monthly_precip_wettest_q),
+              avg_monthly_precip_driest_q = mean(avg_monthly_precip_driest_q),
+              avg_monthly_precip_warmest_q = mean(avg_monthly_precip_warmest_q),
+              avg_monthly_precip_coldest_q = mean(avg_monthly_precip_coldest_q)
+              
+    ) %>%
+    ungroup() %>%
+    dplyr::select(hopkins_bin, avg_temp, avg_diurnal_temp_range, isothermality,
+                  temp_seas, tmax, tmin, annual_temp_range, avg_monthly_temp_wettest_q,
+                  avg_monthly_temp_driest_q, avg_monthly_temp_warmest_q, avg_monthly_temp_coldest_q,
+                  annual_precip, precip_wettest_month, precip_driest_month, precip_seas,
+                  avg_monthly_precip_wettest_q, avg_monthly_precip_driest_q, avg_monthly_precip_warmest_q,
+                  avg_monthly_precip_coldest_q)
+  ## Join 
+  phen_estimates <- phen_estimates %>% 
+    inner_join(hopkins_bin_env_summaries, by = "hopkins_bin")
+  
+  ## Remove Outliers 
+  phen_estimates <-  phen_estimates %>% 
+    group_by(species) %>% 
+    mutate(zonset = scale(onset_doy)) %>% 
+    filter(between(zonset,-3.25,+3.25))
+  
+  
+  ## Use Species Anchoring To Create a Predicted Hopkins Onset
+  # Use Rob's estimate sp anchors fxn
+  HOPKINS_LAT_SLOPE <- 4
+  HOPKINS_ELEV_SLOPE <- 4/122
+  estimate_species_anchors <- function(df) {
+    df |> group_by(species) |>
+      group_modify(~{
+        x <- .x
+        slat <- median(x$lat_mean, na.rm = TRUE)
+        selev <- median(x$mid_elev, na.rm = TRUE)  
+        
+        if (nrow(x) >= 10 && length(unique(x$lat_mean[!is.na(x$lat_mean)])) > 2) {
+          m <- lm(onset ~ lat_mean, data = x)
+          sdoy <- as.numeric(predict(m, newdata = data.frame(lat_mean = slat)))
+        } else {
+          sdoy <- median(x$onset, na.rm = TRUE)
+        }
+        tibble(start_lat = slat, start_elev = selev, start_doy = sdoy) 
+      }) |>
+      ungroup()
+  }
+  
+  # bin summary (for creating hopkins predictions)
+  bin_summary <- phen_data %>%
+    group_by(species, hopkins_bin) %>%
+    summarise(
+      hopkins_lat = median(latitude, na.rm = TRUE),
+      hopkins_elev = median(elevation_m, na.rm = TRUE),
+      hopkins_delay = median(hopkins_delay_days, na.rm = TRUE),
+      n_obs = n(),
+      .groups = 'drop'
+    )
+  
+  # join bins 
+  phen_estimates <- phen_estimates %>% 
+    left_join(bin_summary, by = "hopkins_bin") %>% 
+    rename(lat_mean = hopkins_lat, 
+           mid_elev = hopkins_elev, 
+           onset = onset_doy, 
+           species = species.x) # redundant
+  
+  anchored_sp <- estimate_species_anchors(phen_estimates)
+  
+  
+  phen_estimate <- phen_estimates %>% 
+    left_join(anchored_sp, by = 'species')
+  
+  # extract midpoint of each hopkins bin to use as predictor
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      # Extract numeric values from bin intervals
+      bin_lower = as.numeric(sub("\\((.+),.+\\]", "\\1", hopkins_bin)),
+      bin_upper = as.numeric(sub("\\(.+,(.+)\\]", "\\1", hopkins_bin)),
+      hopkins_delay_midpoint = (bin_lower + bin_upper) / 2
+    )
+  
+  ## Run a Hopkins model based on bins
+  hopkins_model <- lm(onset ~ hopkins_delay_midpoint, data = phen_estimate)
+  r2_hop <- performance::r2(hopkins_model)
+  res_hop <- residuals(hopkins_model)
+  rmse_val_hop <- sqrt(mean(res_hop^2))
+  # Extract the corrected slope (actual delay rate per Hopkins bin unit)
+  actual_delay_rate <- coef(hopkins_model)[2]
+  actual_delay_se <- summary(hopkins_model)$coefficients[2, 2]
+  # Apply the corrected slope with uncertainty bounds
+  phen_estimate <- phen_estimate %>%
+    mutate(
+      #cCalculate delay from the anchor point using Hopkins bins
+      delay_from_anchor = hopkins_delay_midpoint - 
+        ((start_lat - min_lat) * 4 + 
+           (start_elev - min_elev) / 120 * 4),
+      
+      # apply actual observed delay rate
+      corrected_onset_prediction = start_doy + (delay_from_anchor * actual_delay_rate),
+      
+      # Add uncertainty bounds based on SE of slope
+      corrected_onset_lower = start_doy + (delay_from_anchor * (actual_delay_rate - actual_delay_se)),
+      corrected_onset_upper = start_doy + (delay_from_anchor * (actual_delay_rate + actual_delay_se))
+    )
+  
+  #### ONSET ENV MODEL ######################################################################################
+  if(nrow(phen_estimate) > 3){ # min req to make env
+    predictors <- c("avg_temp", "avg_diurnal_temp_range", "isothermality",
+                    "temp_seas", "tmax", "tmin", "annual_temp_range",
+                    "avg_monthly_temp_wettest_q", "avg_monthly_temp_driest_q",
+                    "avg_monthly_temp_warmest_q", "avg_monthly_temp_coldest_q",
+                    "annual_precip", "precip_wettest_month", "precip_driest_month",
+                    "precip_seas", "avg_monthly_precip_wettest_q", "avg_monthly_precip_driest_q",
+                    "avg_monthly_precip_warmest_q", "avg_monthly_precip_coldest_q") 
+    
+    ## scale predictors using scale()
+    phen_estimate_scaled <- phen_estimate
+    scaling_params <- list()
+    
+    for(pred in predictors) {
+      if(pred %in% names(phen_estimate)) {
+        scaled_var <- scale(phen_estimate[[pred]])
+        phen_estimate_scaled[[pred]] <- as.vector(scaled_var)
+        scaling_params[[pred]] <- list(
+          center = attr(scaled_var, "scaled:center"),
+          scale = attr(scaled_var, "scaled:scale")
+        )
+      }
+    }
+    
+    ## generate all combinations of 3 predictors
+    all_combos <- combn(predictors, 3, simplify = FALSE)
+    
+    ## fit models with model selection and VIF checks
+    vif_threshold <- 5
+    model_results <- list()
+    
+    for(pred_combo in all_combos) {
+      # Start with 3-predictor model (using scaled data)
+      formula_str <- paste("onset ~", paste(pred_combo, collapse = " + "))
+      full_model <- glm(as.formula(formula_str), data = phen_estimate_scaled)
+      
+      ## apply stepwise selection
+      best_model <- MASS::stepAIC(full_model, direction = "both", trace = FALSE)
+      
+      ## count number of predictors
+      n_predictors <- length(coef(best_model)) - 1
+      
+      ## check VIF only if 2+ predictors
+      passes_vif <- TRUE
+      max_vif <- NA
+      
+      if(n_predictors >= 2){
+        vif_results <- performance::check_collinearity(best_model)
+        max_vif <- max(vif_results$VIF)
+        passes_vif <- all(vif_results$VIF < vif_threshold)
+        
+        if(!passes_vif){ # lots of text, was useful while testing.
+          # cat("Excluding model with predictors:", paste(names(coef(best_model))[-1], collapse = ", "), 
+          #     "- Max VIF =", round(max_vif, 2), "\n")
+        }
+      }
+      
+      if(passes_vif){
+        model_results[[length(model_results) + 1]] <- list(
+          model = best_model,
+          aic = AIC(best_model),
+          predictors = names(coef(best_model))[-1],
+          formula = formula(best_model),
+          max_vif = max_vif,
+          n_predictors = n_predictors,
+          pred_signature = paste(sort(names(coef(best_model))[-1]), collapse = "_")
+        )
+      }
+    }
+    
+    # check if we have any valid models
+    if(length(model_results) == 0){
+      cat("No models passed VIF threshold of", vif_threshold, "\n")
+    } else {
+      cat("\n", length(model_results), "models passed VIF checks\n")
+      
+      # deduplicate models
+      unique_signatures <- unique(sapply(model_results, function(x) x$pred_signature))
+      unique_models <- lapply(unique_signatures, function(sig) {
+        model_results[[which(sapply(model_results, function(x) x$pred_signature == sig))[1]]]
+      })
+      
+      cat("After deduplication:", length(unique_models), "unique models\n")
+      
+      # extract AICs and find best
+      aics <- sapply(unique_models, function(x) x$aic)
+      best_aic <- min(aics)
+      
+      # identify models within 2 AIC units of best
+      top_models_idx <- which(aics - best_aic < 2)
+      top_models <- unique_models[top_models_idx]
+      
+      # cap at top 10 models
+      max_ensemble_size <- 10
+      if(length(top_models) > max_ensemble_size){
+        aic_order <- order(sapply(top_models, function(x) x$aic))
+        top_models <- top_models[aic_order[1:max_ensemble_size]]
+        cat("Capping ensemble at", max_ensemble_size, "models\n")
+      }
+      
+      cat("Best AIC:", best_aic, "\n")
+      cat("Number of unique models within 2 AIC units:", length(top_models), "\n")
+      
+      # check for high variability if multiple models
+      use_single_model <- FALSE
+      if(length(top_models) > 1) {
+        cat("\nChecking coefficient stability across ensemble candidates:\n")
+        
+        # thresholds for instability
+        cv_threshold <- 50  # CV > 50% is concerning
+        iqr_threshold <- 0.5  # IQR/mean > 0.5 is concerning
+        
+        all_predictors <- unique(unlist(lapply(top_models, function(x) x$predictors)))
+        high_variability_found <- FALSE
+        
+        for(pred in all_predictors) {
+          coefs <- sapply(top_models, function(x) {
+            if(pred %in% names(coef(x$model))) {
+              coef(x$model)[pred]
+            } else {
+              NA
+            }
+          })
+          coefs <- coefs[!is.na(coefs)]
+          
+          if(length(coefs) > 1) {
+            mean_coef <- mean(coefs)
+            sd_coef <- sd(coefs)
+            iqr_coef <- IQR(coefs)
+            q25 <- quantile(coefs, 0.25)
+            q75 <- quantile(coefs, 0.75)
+            
+            # calc CV only if mean is not near zero
+            cv <- NA
+            cv_high <- FALSE
+            if(abs(mean_coef) > 0.01) {
+              cv <- (sd_coef / abs(mean_coef)) * 100
+              cv_high <- cv > cv_threshold
+            } else {
+              cv_high <- TRUE  # near-zero mean with variation is unstable
+            }
+            
+            ## calc relative IQR
+            iqr_relative <- ifelse(abs(mean_coef) > 0.01, iqr_coef / abs(mean_coef), NA)
+            iqr_high <- !is.na(iqr_relative) && iqr_relative > iqr_threshold
+            
+            ## report stability
+            cat("  ", pred, ":\n")
+            if(!is.na(cv)) {
+              cat("    Mean =", round(mean_coef, 3), ", SD =", round(sd_coef, 3), 
+                  ", CV =", round(cv, 1), "%")
+              if(cv_high) cat(" [HIGH CV!]")
+              cat("\n")
+            } else {
+              cat("    Mean ≈ 0 (", round(mean_coef, 4), "), SD =", round(sd_coef, 3))
+              cat(" [UNSTABLE - near-zero mean]\n")
+            }
+            
+            cat("    IQR =", round(iqr_coef, 3), " (Q1 =", round(q25, 3), 
+                ", Q3 =", round(q75, 3), ")")
+            if(iqr_high) cat(" [HIGH IQR!]")
+            cat("\n")
+            
+            ## flag if either metric shows high variability
+            if(cv_high || iqr_high) {
+              high_variability_found <- TRUE
+            }
+          } else if(length(coefs) == 1) {
+            cat("  ", pred, ": appears in only 1 model (coef =", round(coefs, 3), ")\n")
+          }
+        }
+        
+        ## IF its unstable, then use single model 
+        if(high_variability_found) {
+          cat("\n⚠ High coefficient variability detected across ensemble.\n")
+          cat("Selecting single best model instead of ensembling.\n")
+          use_single_model <- TRUE
+        } else {
+          cat("\n Coefficient stability acceptable across ensemble.\n")
+        }
+        cat("\n")
+      }
+      
+      ## create env_model
+      if(length(top_models) == 1 || use_single_model) {
+        ## single best model (either only 1 candidate or forced by instability)
+        if(use_single_model) {
+          ## select the single best model by AIC
+          best_idx <- which.min(sapply(top_models, function(x) x$aic))
+          top_models <- list(top_models[[best_idx]])
+        }
+        
+        env_model <- top_models[[1]]$model
+        env_model$scaling_params <- scaling_params
+        class(env_model) <- c("scaled_glm", class(env_model))
+        
+        cat("Using single best model with", top_models[[1]]$n_predictors, "predictor(s):",
+            paste(top_models[[1]]$predictors, collapse = ", "), "\n")
+        cat("AIC =", round(top_models[[1]]$aic, 2), "\n")
+        
+        ## customized predict for single scaled model to be saved for l8ter
+        predict.scaled_glm <- function(object, newdata = NULL, type = "response", ...) {
+          if(!is.null(newdata)) {
+            newdata_scaled <- newdata
+            for(pred in names(object$scaling_params)) {
+              if(pred %in% names(newdata)) {
+                newdata_scaled[[pred]] <- (newdata[[pred]] - object$scaling_params[[pred]]$center) / 
+                  object$scaling_params[[pred]]$scale
+              }
+            }
+            predict.glm(object, newdata = newdata_scaled, type = type, ...)
+          } else {
+            predict.glm(object, type = type, ...)
+          }
+        }
+      } else {
+        
+        ## ensemble of top models
+        cat("Ensembling", length(top_models), "models\n")
+        
+        delta_aic <- sapply(top_models, function(x) x$aic - best_aic)
+        aic_weights <- exp(-0.5 * delta_aic)
+        aic_weights <- aic_weights / sum(aic_weights)
+        
+        for(i in seq_along(top_models)) {
+          vif_str <- if(is.na(top_models[[i]]$max_vif)) "N/A" else round(top_models[[i]]$max_vif, 2)
+          cat("  Model", i, "(", top_models[[i]]$n_predictors, "pred):",
+              paste(top_models[[i]]$predictors, collapse = ", "),
+              "(AIC =", round(top_models[[i]]$aic, 2), ", Weight =", round(aic_weights[i], 3), ")\n")
+        }
+        
+        ## create ensemble model object
+        env_model <- structure(
+          list(
+            models = lapply(top_models, function(x) x$model),
+            weights = aic_weights,
+            scaling_params = scaling_params,
+            call = call("ensemble"),
+            coefficients = top_models[[1]]$model$coefficients
+          ),
+          class = c("ensemble_glm", "list")
+        )
+        
+        ## custom predict method for ensemble (use for later)
+        predict.ensemble_glm <- function(object, newdata = NULL, type = "response", ...) {
+          if(!is.null(newdata)) {
+            newdata_scaled <- newdata
+            for(pred in names(object$scaling_params)) {
+              if(pred %in% names(newdata)) {
+                newdata_scaled[[pred]] <- (newdata[[pred]] - object$scaling_params[[pred]]$center) / 
+                  object$scaling_params[[pred]]$scale
+              }
+            }
+          } else {
+            newdata_scaled <- NULL
+          }
+          
+          predictions <- sapply(object$models, function(model) {
+            predict(model, newdata = newdata_scaled, type = type, ...)
+          })
+          
+          if(is.matrix(predictions)) {
+            predictions %*% object$weights
+          } else {
+            sum(predictions * object$weights)
+          }
+        }
+      }
+      
+      # generate predictions and residuals
+      phen_estimate$predicted <- predict(env_model, newdata = phen_estimate, type = "response")
+      phen_estimate$residuals <- phen_estimate$onset - phen_estimate$predicted
+      
+      # calculate metrics
+      res_env <- phen_estimate$residuals
+      rmse_val <- sqrt(mean(res_env^2))
+      
+      # calculate R²
+      ss_res <- sum(res_env^2)
+      ss_tot <- sum((phen_estimate$onset - mean(phen_estimate$onset))^2)
+      r2_val <- 1 - (ss_res / ss_tot)
+      
+      cat("R² =", round(r2_val, 3), "| RMSE =", round(rmse_val, 3), "\n")
+    }
+  }
+  phen_estimate <- phen_estimate %>% 
+    rename(predicted_onset = predicted) 
+  
+  
+  # ensure that hopkins_delay_midpoint is available in the original raw data as well
+  phen_data <- phen_data %>% 
+    mutate(
+      # Extract numeric values from bin intervals
+      bin_lower = as.numeric(sub("\\((.+),.+\\]", "\\1", hopkins_bin)),
+      bin_upper = as.numeric(sub("\\(.+,(.+)\\]", "\\1", hopkins_bin)),
+      hopkins_delay_midpoint = (bin_lower + bin_upper) / 2
+    )
+  
+  ################################################################################################
+  ## Visualize Outputs 
+  # Hopkins Only
+  hop_plot1 <- ggplot(phen_estimate, aes(x = hopkins_delay_midpoint, y = onset)) +
+    geom_point(size = 3) +
+    geom_smooth(method = "lm", se = TRUE) +
+    annotate("text", x = min(phen_estimate$hopkins_delay_midpoint), y = max(phen_estimate$onset),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_hop[[2]], rmse_val_hop),
+             hjust = 0, vjust = 1) +
+    labs(x = "Hopkins Expected Delay Bin (Middle Value for Bin)",
+         y = "Observed Onset (day of year)",
+         title = paste("Testing Hopkins Bioclimatic Law on", target_taxa[1])) +
+    theme_minimal()
+  hop_plot2 <- ggplot(phen_estimate, aes(x = corrected_onset_prediction, y = onset)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    #geom_ribbon(aes(ymin = corrected_onset_lower, ymax = corrected_onset_upper), 
+    #alpha = 0.2, fill = "blue") +
+    geom_point(size = 3) +
+    annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$corrected_onset_prediction),
+             label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_hop[[2]], rmse_val_hop),
+             hjust = 0, vjust = 1) +
+    labs(x = "Corrected Predicted Onset (anchored + actual slope)",
+         y = "Empirical Estimate Onset (day of year)",
+         title = paste("Testing Hopkins Bioclimatic Law on", target_taxa[1])) +
+    theme_bw()
+  # Env Space
+  if(nrow(phen_estimate) > 3){
+    env_plot <- ggplot(phen_estimate, aes(x = onset, y = predicted_onset)) +
+      geom_point(alpha = 0.6) +
+      geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+      annotate("text", x = min(phen_estimate$onset), y = max(phen_estimate$predicted_onset),
+               label = sprintf("R² = %.3f\nRMSE = %.2f days", r2_val, rmse_val),
+               hjust = 0, vjust = 1) +
+      labs(x = "Observed Onset", y = "Predicted Onset", 
+           title = paste("Using Climatic Vars to Predict", target_taxa[1])) +
+      theme_bw()
+
+    
+  }
+  
+  if(nrow(phen_estimate) > 3){
+    # return everything as list
+    return(list(
+      hopkins_model = hopkins_model, 
+      env_model_onset = env_model,
+      data = phen_data,
+      phen_est_data = phen_estimate, 
+      plots = list(hopkins = c(hop_plot1, hop_plot2), enviroment = c(env_plot)), 
+      metrics = list(
+        hopkins_r2 = r2_hop[[2]], 
+        hopkins_rsme = rmse_val_hop, 
+        env_r2_onset = r2_val, 
+        env_rsme_onset = rmse_val
+      )
+    ))
+  } else{
+    # return everything as list
+    return(list(
+      hopkins_model = hopkins_model, 
+      env_model_onset = NULL, 
+      data = phen_data,
+      phen_est_data = phen_estimate, 
+      plots = list(hopkins = c(hop_plot1, hop_plot2), enviroment = NULL), 
+      metrics = list(
+        hopkins_r2 = r2_hop[[2]], 
+        hopkins_rsme = rmse_val_hop, 
+        env_r2 = NULL, 
+        env_rsme = NULL
+      )
+    ))
+    
+  }
+}
+
+target_taxa <- "Anthophora hololeuca"
+
+a_holo_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "bees", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 21, # found by histogram
+                                          max_doy = 234)
+
+a_holo_out$plots$hopkins
+a_holo_out$plots$enviroment
+
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorodendron arborescens") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_a_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 30, # found by histogram
+                                          max_doy = 228)
+
+psoro_a_out$plots$hopkins
+psoro_a_out$plots$enviroment
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorothamnus polydenius") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_p_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 38, # found by histogram
+                                          max_doy = 244)
+
+psoro_p_out$plots$hopkins
+psoro_p_out$plots$enviroment
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorodendron fremontii") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_f_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 19, # found by histogram
+                                          max_doy = 238)
+
+psoro_f_out$plots$hopkins
+psoro_f_out$plots$enviroment
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorothamnus emoryi") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_e_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 12, # found by histogram
+                                          max_doy = 185)
+
+psoro_e_out$plots$hopkins
+psoro_e_out$plots$enviroment
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorodendron schottii") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_sc_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 15, # found by histogram
+                                          max_doy = 215)
+
+psoro_sc_out$plots$hopkins
+psoro_sc_out$plots$enviroment
+
+target_taxa <- na_taxonomy %>% 
+    filter(alignedParentName == "Psorodendron spinosum") %>% 
+    arrange(desc(nameStatus == "Accepted"), desc(alignedParentName == name)) %>% 
+    pull(name)
+
+psoro_sp_out <- model_baseline_onset_w_clim(target_taxa, 
+                                          bees_or_plants = "plants", 
+                                          phenovision_flowering_data = phenovision_flowering_data,
+                                          cch2_annotated_specimens = cch2_annotated_specimens, 
+                                          bee_occs = bee_occs, 
+                                          extra_hololeuca_data = extra_hololeuca_data, 
+                                          min_doy = 86, # found by histogram
+                                          max_doy = 248)
+
+psoro_sp_out$plots$hopkins
+psoro_sp_out$plots$enviroment
+```
+
+
+
